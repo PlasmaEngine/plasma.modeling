@@ -2,6 +2,7 @@
 
 #include <EditorFramework/EditTools/EditTool.h>
 #include <EditorFramework/Gizmos/DrawBoxGizmo.h>
+#include <EditorPluginModeling/Brush/BrushToolContext.h>
 #include <EditorPluginModeling/EditorPluginModelingDLL.h>
 
 struct plGameObjectEvent;
@@ -40,4 +41,5 @@ private:
   void GizmoEventHandler(const plGizmoEvent& e);
 
   plDrawBoxGizmo m_DrawBoxGizmo;
+  plBrushToolContext m_ToolContext; ///< all brush input; forwards to the draw gizmo in Object mode
 };

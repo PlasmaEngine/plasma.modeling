@@ -101,6 +101,10 @@ public:
   void SetFaceData(const plDataBuffer& data);                 // [ property ]
   const plDataBuffer& GetFaceData() const { return m_FaceData; } // [ property ]
 
+  /// \brief The serialized plEditableMesh, authoritative once Shape is Editable. Empty while parametric.
+  void SetStoredMesh(const plDataBuffer& data);                     // [ property ]
+  const plDataBuffer& GetStoredMesh() const { return m_StoredMesh; } // [ property ]
+
   void SetMaterial(plUInt32 uiIndex, const plMaterialResourceHandle& hMaterial);
   plMaterialResourceHandle GetMaterial(plUInt32 uiIndex) const;
 

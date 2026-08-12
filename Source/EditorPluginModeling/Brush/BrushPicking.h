@@ -18,4 +18,7 @@ namespace plBrushPicking
   /// The point is expected to lie ON the surface (it comes from GPU picking), so this matches by
   /// nearest face plane with a point-in-polygon containment test, not by raycast.
   plUInt32 PickFaceAtLocalPos(const plEditableMesh& mesh, const plVec3& vLocalPos);
+
+  /// \brief Same match, returning the face INDEX instead of its id. -1 when nothing matches.
+  plInt32 PickFaceIndexAtLocalPos(const plEditableMesh& mesh, const plVec3& vLocalPos);
 } // namespace plBrushPicking

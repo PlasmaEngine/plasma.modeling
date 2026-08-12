@@ -39,6 +39,7 @@ PL_BEGIN_COMPONENT_TYPE(plBrushComponent, 1, plComponentMode::Static)
     PL_ACCESSOR_PROPERTY("IncludeInNavmesh", GetIncludeInNavmesh, SetIncludeInNavmesh)->AddAttributes(new plDefaultValueAttribute(true)),
     PL_MEMBER_PROPERTY("UseAsOccluder", m_bUseAsOccluder)->AddAttributes(new plDefaultValueAttribute(true)),
     PL_ACCESSOR_PROPERTY("FaceData", GetFaceData, SetFaceData)->AddAttributes(new plHiddenAttribute()),
+    PL_ACCESSOR_PROPERTY("StoredMesh", GetStoredMesh, SetStoredMesh)->AddAttributes(new plHiddenAttribute()),
   }
   PL_END_PROPERTIES;
   PL_BEGIN_ATTRIBUTES
@@ -263,6 +264,12 @@ void plBrushComponent::SetIncludeInNavmesh(bool b)
 void plBrushComponent::SetFaceData(const plDataBuffer& data)
 {
   m_FaceData = data;
+  InvalidateMesh();
+}
+
+void plBrushComponent::SetStoredMesh(const plDataBuffer& data)
+{
+  m_StoredMesh = data;
   InvalidateMesh();
 }
 

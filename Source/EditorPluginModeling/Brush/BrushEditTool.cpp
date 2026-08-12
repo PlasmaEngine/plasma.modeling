@@ -28,7 +28,7 @@ plBrushEditTool::~plBrushEditTool()
 plEditorInputContext* plBrushEditTool::GetEditorInputContextOverride()
 {
   if (IsActive())
-    return &m_DrawBoxGizmo;
+    return &m_ToolContext;
 
   return nullptr;
 }
@@ -130,6 +130,10 @@ void plBrushEditTool::OnConfigured()
   plManipulatorManager::GetSingleton()->m_Events.AddEventHandler(plMakeDelegate(&plBrushEditTool::ManipulatorManagerEventHandler, this));
 
   m_DrawBoxGizmo.SetOwner(GetWindow(), nullptr);
+
+  m_ToolContext.SetOwner(GetWindow(), nullptr);
+  m_ToolContext.SetDrawGizmo(&m_DrawBoxGizmo);
+  m_ToolContext.SetDocument(GetDocument());
 }
 
 void plBrushEditTool::OnActiveChanged(bool bIsActive)
@@ -137,6 +141,11 @@ void plBrushEditTool::OnActiveChanged(bool bIsActive)
   if (bIsActive)
   {
     m_DrawBoxGizmo.UpdateStatusBarText(GetWindow());
+  }
+  else
+  {
+    // leaving the tool ends any sub-object session; the next activation starts in draw mode
+    m_ToolContext.SetSubMode(plBrushSubMode::Object);
   }
 }
 

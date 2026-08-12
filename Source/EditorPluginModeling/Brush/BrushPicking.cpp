@@ -19,7 +19,9 @@ plResult plBrushPicking::BuildMeshFromObject(const plDocumentObject* pComponent,
   const plBrushShape::Enum shape = static_cast<plBrushShape::Enum>(acc.GetValue("Shape").ConvertTo<plInt32>());
 
   if (shape == plBrushShape::Editable)
-    return PL_FAILURE;
+  {
+    return out_mesh.FromDataBuffer(acc.GetValue("StoredMesh").ConvertTo<plDataBuffer>());
+  }
 
   plBrushGeneratorParams params;
   params.m_fSizeNegX = acc.GetValue("SizeNegX").ConvertTo<float>();
@@ -37,6 +39,13 @@ plResult plBrushPicking::BuildMeshFromObject(const plDocumentObject* pComponent,
 }
 
 plUInt32 plBrushPicking::PickFaceAtLocalPos(const plEditableMesh& mesh, const plVec3& vLocalPos)
+{
+  const plInt32 iFace = PickFaceIndexAtLocalPos(mesh, vLocalPos);
+
+  return (iFace >= 0) ? mesh.m_Faces[iFace].m_uiFaceId : plInvalidIndex;
+}
+
+plInt32 plBrushPicking::PickFaceIndexAtLocalPos(const plEditableMesh& mesh, const plVec3& vLocalPos)
 {
   plUInt32 uiBestFace = plInvalidIndex;
   float fBestDist = plMath::MaxValue<float>();
@@ -88,11 +97,11 @@ plUInt32 plBrushPicking::PickFaceAtLocalPos(const plEditableMesh& mesh, const pl
     }
   }
 
-  // the drop position sits on the surface, so a contained face should exist; the nearest-plane
+  // the pick position sits on the surface, so a contained face should exist; the nearest-plane
   // fallback covers numeric edge cases at corners
   const plUInt32 uiPicked = (uiBestFace != plInvalidIndex) ? uiBestFace : uiBestFaceNoContainment;
 
-  return (uiPicked != plInvalidIndex) ? mesh.m_Faces[uiPicked].m_uiFaceId : plInvalidIndex;
+  return (uiPicked != plInvalidIndex) ? static_cast<plInt32>(uiPicked) : -1;
 }
 
 
