@@ -47,6 +47,34 @@ plQtModelingPanel::plQtModelingPanel(plQtDocumentWindow* pWindow, plDocument* pD
   pLayout->setContentsMargins(6, 6, 6, 6);
   pLayout->setSpacing(6);
 
+  // ---- Mode -----------------------------------------------------------------
+  QLabel* pModeHeader = new QLabel("Mode", pContent);
+  pLayout->addWidget(pModeHeader);
+
+  QGridLayout* pModeGrid = new QGridLayout();
+  pModeGrid->setSpacing(3);
+
+  m_pModeButtons = new QButtonGroup(this);
+  m_pModeButtons->setExclusive(true);
+
+  const char* szModeLabels[] = {"Object", "Vertex", "Edge", "Face"};
+  const char* szModeHints[] = {"Draw and place brushes (Esc)", "Edit vertices (1)", "Edit edges (2)", "Edit faces (3)"};
+
+  for (int i = 0; i < 4; ++i)
+  {
+    QPushButton* pButton = new QPushButton(szModeLabels[i], pContent);
+    pButton->setCheckable(true);
+    pButton->setToolTip(szModeHints[i]);
+
+    m_pModeButtons->addButton(pButton, i);
+    pModeGrid->addWidget(pButton, i / 2, i % 2);
+  }
+
+  pLayout->addLayout(pModeGrid);
+
+  connect(m_pModeButtons, &QButtonGroup::idClicked, this, &plQtModelingPanel::OnModeButtonClicked);
+
+  // ---- Primitive ------------------------------------------------------------
   QLabel* pHeader = new QLabel("Primitive", pContent);
   pLayout->addWidget(pHeader);
 
@@ -78,15 +106,21 @@ plQtModelingPanel::plQtModelingPanel(plQtDocumentWindow* pWindow, plDocument* pD
 
   connect(m_pShapeButtons, &QButtonGroup::idClicked, this, &plQtModelingPanel::OnShapeButtonClicked);
 
-  // the checked button is a mode indicator, so it has to clear when draw mode ends
+  // the checked buttons are mode indicators, so they have to follow tool and keyboard state
   if (plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument))
   {
     pGameDoc->m_GameObjectEvents.AddEventHandler(plMakeDelegate(&plQtModelingPanel::GameObjectEventHandler, this));
   }
+
+  plBrushToolContext::s_ModeEvents.AddEventHandler(plMakeDelegate(&plQtModelingPanel::BrushModeEventHandler, this));
+
+  SetCheckedMode(-1);
 }
 
 plQtModelingPanel::~plQtModelingPanel()
 {
+  plBrushToolContext::s_ModeEvents.RemoveEventHandler(plMakeDelegate(&plQtModelingPanel::BrushModeEventHandler, this));
+
   if (plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument))
   {
     pGameDoc->m_GameObjectEvents.RemoveEventHandler(plMakeDelegate(&plQtModelingPanel::GameObjectEventHandler, this));
@@ -101,7 +135,45 @@ void plQtModelingPanel::OnShapeButtonClicked(int iShape)
   if (plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument))
   {
     pGameDoc->SetActiveEditTool(plGetStaticRTTI<plBrushEditTool>());
+
+    // drawing happens in Object mode
+    if (plBrushEditTool* pTool = plDynamicCast<plBrushEditTool*>(pGameDoc->GetActiveEditTool()))
+    {
+      pTool->GetToolContext().SetSubMode(plBrushSubMode::Object);
+      SetCheckedMode(plBrushSubMode::Object);
+    }
   }
+}
+
+void plQtModelingPanel::OnModeButtonClicked(int iMode)
+{
+  plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument);
+
+  if (pGameDoc == nullptr)
+    return;
+
+  pGameDoc->SetActiveEditTool(plGetStaticRTTI<plBrushEditTool>());
+
+  plBrushEditTool* pTool = plDynamicCast<plBrushEditTool*>(pGameDoc->GetActiveEditTool());
+
+  if (pTool == nullptr)
+  {
+    SetCheckedMode(-1);
+    return;
+  }
+
+  pTool->GetToolContext().SetSubMode(static_cast<plBrushSubMode::Enum>(iMode));
+
+  // entering a sub-object mode can be refused (no brush selected) — show the mode that resulted
+  SetCheckedMode(static_cast<int>(pTool->GetToolContext().GetSubMode()));
+}
+
+void plQtModelingPanel::BrushModeEventHandler(const plBrushModeEvent& e)
+{
+  if (e.m_pDocument != m_pDocument)
+    return;
+
+  SetCheckedMode(static_cast<int>(e.m_Mode));
 }
 
 void plQtModelingPanel::GameObjectEventHandler(const plGameObjectEvent& e)
@@ -116,10 +188,27 @@ void plQtModelingPanel::GameObjectEventHandler(const plGameObjectEvent& e)
 
   plGameObjectEditTool* pTool = pGameDoc->GetActiveEditTool();
 
-  if (pTool == nullptr || !pTool->GetDynamicRTTI()->IsDerivedFrom<plBrushEditTool>())
+  if (plBrushEditTool* pBrushTool = plDynamicCast<plBrushEditTool*>(pTool))
+  {
+    SetCheckedMode(static_cast<int>(pBrushTool->GetToolContext().GetSubMode()));
+  }
+  else
   {
     UncheckAllButtons();
+    SetCheckedMode(-1);
   }
+}
+
+void plQtModelingPanel::SetCheckedMode(int iMode)
+{
+  m_pModeButtons->setExclusive(false);
+
+  for (QAbstractButton* pButton : m_pModeButtons->buttons())
+  {
+    pButton->setChecked(m_pModeButtons->id(pButton) == iMode);
+  }
+
+  m_pModeButtons->setExclusive(true);
 }
 
 void plQtModelingPanel::UncheckAllButtons()

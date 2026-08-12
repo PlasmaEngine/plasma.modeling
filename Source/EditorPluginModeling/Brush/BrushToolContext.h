@@ -19,6 +19,18 @@ struct plBrushSubMode
   };
 };
 
+class plBrushToolContext;
+
+/// \brief Broadcast whenever a brush context changes its sub-object mode, so UI (the Modeling panel's
+/// mode buttons) can mirror keyboard-driven changes. Static because contexts are created lazily with
+/// their edit tool, after any panel exists.
+struct plBrushModeEvent
+{
+  const plBrushToolContext* m_pContext = nullptr;
+  const plGameObjectDocument* m_pDocument = nullptr;
+  plBrushSubMode::Enum m_Mode = plBrushSubMode::Object;
+};
+
 /// \brief The single input context for all brush editing while the Brush tool is active.
 ///
 /// In Object mode every event is forwarded to the edit tool's plDrawBoxGizmo, so drawing behaves as in
@@ -39,9 +51,12 @@ public:
 
   void SetDrawGizmo(plDrawBoxGizmo* pGizmo) { m_pDrawGizmo = pGizmo; }
   void SetDocument(plGameObjectDocument* pDocument) { m_pDocument = pDocument; }
+  plGameObjectDocument* GetDocument() const { return m_pDocument; }
 
   plBrushSubMode::Enum GetSubMode() const { return m_SubMode; }
   void SetSubMode(plBrushSubMode::Enum mode);
+
+  static plEvent<const plBrushModeEvent&> s_ModeEvents;
 
   virtual void UpdateStatusBarText(plQtEngineDocumentWindow* pWindow) override;
 

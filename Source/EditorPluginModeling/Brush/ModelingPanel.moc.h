@@ -9,6 +9,7 @@ class plQtDocumentWindow;
 class QButtonGroup;
 
 struct plGameObjectEvent;
+struct plBrushModeEvent;
 
 /// \brief The Modeling dock panel: a primitive palette. Clicking a shape arms the Brush draw tool with
 /// it — the next click in the viewport starts drawing that primitive. The checked button doubles as the
@@ -27,13 +28,17 @@ public:
 
 private Q_SLOTS:
   void OnShapeButtonClicked(int iShape);
+  void OnModeButtonClicked(int iMode);
 
 private:
   void GameObjectEventHandler(const plGameObjectEvent& e);
+  void BrushModeEventHandler(const plBrushModeEvent& e);
   void UncheckAllButtons();
+  void SetCheckedMode(int iMode); ///< -1 = none (tool inactive)
 
   plDocument* m_pDocument = nullptr;
   QButtonGroup* m_pShapeButtons = nullptr;
+  QButtonGroup* m_pModeButtons = nullptr;
 };
 
 /// \brief Watches document windows and docks a Modeling panel into every scene window.

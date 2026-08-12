@@ -17,6 +17,8 @@
 PL_BEGIN_DYNAMIC_REFLECTED_TYPE(plBrushToolContext, 1, plRTTINoAllocator)
 PL_END_DYNAMIC_REFLECTED_TYPE;
 
+plEvent<const plBrushModeEvent&> plBrushToolContext::s_ModeEvents;
+
 plBrushToolContext::plBrushToolContext()
 {
   m_hHoverLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(6, 250, 201), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
@@ -371,6 +373,12 @@ void plBrushToolContext::SetSubMode(plBrushSubMode::Enum mode)
   {
     UpdateStatusBarText(GetOwnerWindow());
   }
+
+  plBrushModeEvent e;
+  e.m_pContext = this;
+  e.m_pDocument = m_pDocument;
+  e.m_Mode = m_SubMode;
+  s_ModeEvents.Broadcast(e);
 }
 
 //////////////////////////////////////////////////////////////////////////

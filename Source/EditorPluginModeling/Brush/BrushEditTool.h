@@ -30,6 +30,8 @@ public:
   virtual bool GetSupportsMoveParentOnly() const override;
   virtual void GetGridSettings(plGridSettingsMsgToEngine& out_gridSettings) override;
 
+  plBrushToolContext& GetToolContext() { return m_ToolContext; }
+
 protected:
   virtual void OnConfigured() override;
   virtual void OnActiveChanged(bool bIsActive) override;
