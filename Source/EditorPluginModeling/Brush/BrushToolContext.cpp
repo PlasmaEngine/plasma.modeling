@@ -999,9 +999,42 @@ void plBrushToolContext::AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, pl
   }
 }
 
-void plBrushToolContext::AppendFaceStar(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const
+void plBrushToolContext::AppendEdgeBar(plDynamicArray<plVec3>& ref_lines, const plVec3& v0, const plVec3& v1, float fRadius) const
 {
-  // corner-to-centroid star: reads as a "filled" face with a line-only overlay
+  // an edge rendered as a thin elongated wire box — the edge-mode sibling of the vertex box
+  plVec3 vDir = v1 - v0;
+
+  if (vDir.NormalizeIfNotZero(plVec3(1, 0, 0)).Failed())
+    return;
+
+  const plVec3 vHelper = (plMath::Abs(vDir.z) < 0.9f) ? plVec3(0, 0, 1) : plVec3(1, 0, 0);
+
+  plVec3 vN1 = vDir.CrossRH(vHelper);
+  vN1.Normalize();
+  const plVec3 vN2 = vDir.CrossRH(vN1);
+
+  const plVec3 offsets[4] = {vN1 * fRadius, vN2 * fRadius, -vN1 * fRadius, -vN2 * fRadius};
+
+  // four long rails
+  for (const plVec3& vOffset : offsets)
+  {
+    ref_lines.PushBack(v0 + vOffset);
+    ref_lines.PushBack(v1 + vOffset);
+  }
+
+  // diamond caps at both ends
+  for (plUInt32 i = 0; i < 4; ++i)
+  {
+    ref_lines.PushBack(v0 + offsets[i]);
+    ref_lines.PushBack(v0 + offsets[(i + 1) % 4]);
+    ref_lines.PushBack(v1 + offsets[i]);
+    ref_lines.PushBack(v1 + offsets[(i + 1) % 4]);
+  }
+}
+
+void plBrushToolContext::AppendFaceInset(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace, float fInset) const
+{
+  // the face outline shrunk towards its centroid; stacked insets read as a filled face
   const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
   const plBrushFace& face = mesh.m_Faces[uiFace];
 
@@ -1014,10 +1047,13 @@ void plBrushToolContext::AppendFaceStar(plDynamicArray<plVec3>& ref_lines, plUIn
 
   vCenter /= static_cast<float>(face.m_Corners.GetCount());
 
-  for (plUInt32 uiCorner : face.m_Corners)
+  for (plUInt32 i = 0; i < face.m_Corners.GetCount(); ++i)
   {
-    ref_lines.PushBack(mesh.m_Vertices[uiCorner]);
-    ref_lines.PushBack(vCenter);
+    const plVec3 vCur = vCenter + (mesh.m_Vertices[face.m_Corners[i]] - vCenter) * fInset;
+    const plVec3 vNext = vCenter + (mesh.m_Vertices[face.m_Corners[(i + 1) % face.m_Corners.GetCount()]] - vCenter) * fInset;
+
+    ref_lines.PushBack(vCur);
+    ref_lines.PushBack(vNext);
   }
 }
 
@@ -1064,8 +1100,8 @@ void plBrushToolContext::UpdateOverlays()
 
   plDynamicArray<plVec3> lines;
 
-  // candidates: the wireframe shows the editable structure in every mode; vertex mode
-  // additionally marks every vertex so the selectable set is unmistakable
+  // candidates: the wireframe shows the editable structure in every mode; vertex mode marks every
+  // vertex with a box, face mode marks every face with a Blender-style center dot
   AppendWireframe(lines);
 
   if (m_SubMode == plBrushSubMode::Vertex)
@@ -1073,6 +1109,13 @@ void plBrushToolContext::UpdateOverlays()
     for (const plVec3& v : mesh.m_Vertices)
     {
       AppendVertexBox(lines, v, fMarker * 0.35f);
+    }
+  }
+  else if (m_SubMode == plBrushSubMode::Face)
+  {
+    for (plUInt32 uiFace = 0; uiFace < mesh.m_Faces.GetCount(); ++uiFace)
+    {
+      AppendVertexBox(lines, mesh.ComputeFaceCenter(uiFace), fMarker * 0.2f);
     }
   }
 
@@ -1098,13 +1141,14 @@ void plBrushToolContext::UpdateOverlays()
     }
     else if (m_SubMode == plBrushSubMode::Edge && m_Hover.m_iEdgeV0 >= 0)
     {
-      lines.PushBack(mesh.m_Vertices[m_Hover.m_iEdgeV0]);
-      lines.PushBack(mesh.m_Vertices[m_Hover.m_iEdgeV1]);
+      AppendEdgeBar(lines, mesh.m_Vertices[m_Hover.m_iEdgeV0], mesh.m_Vertices[m_Hover.m_iEdgeV1], fMarker * 0.12f);
     }
     else if (m_SubMode == plBrushSubMode::Face)
     {
-      AppendFaceOutline(lines, static_cast<plUInt32>(m_Hover.m_iFace));
-      AppendFaceStar(lines, static_cast<plUInt32>(m_Hover.m_iFace));
+      const plUInt32 uiFace = static_cast<plUInt32>(m_Hover.m_iFace);
+      AppendFaceOutline(lines, uiFace);
+      AppendFaceInset(lines, uiFace, 0.85f);
+      AppendVertexBox(lines, mesh.ComputeFaceCenter(uiFace), fMarker * 0.3f);
     }
   }
 
@@ -1137,8 +1181,10 @@ void plBrushToolContext::UpdateOverlays()
 
     if (uiV0 < mesh.m_Vertices.GetCount() && uiV1 < mesh.m_Vertices.GetCount())
     {
-      lines.PushBack(mesh.m_Vertices[uiV0]);
-      lines.PushBack(mesh.m_Vertices[uiV1]);
+      // solid bar plus filled endpoint boxes — the selected edge owns its vertices visually
+      AppendEdgeBar(lines, mesh.m_Vertices[uiV0], mesh.m_Vertices[uiV1], fMarker * 0.12f);
+      AppendVertexBoxFilled(lines, mesh.m_Vertices[uiV0], fMarker * 0.28f);
+      AppendVertexBoxFilled(lines, mesh.m_Vertices[uiV1], fMarker * 0.28f);
     }
   }
 
@@ -1148,8 +1194,12 @@ void plBrushToolContext::UpdateOverlays()
     {
       if (mesh.m_Faces[uiFace].m_uiFaceId == uiFaceId)
       {
+        // stacked insets read as a filled face; the filled center dot matches the vertex language
         AppendFaceOutline(lines, uiFace);
-        AppendFaceStar(lines, uiFace);
+        AppendFaceInset(lines, uiFace, 0.75f);
+        AppendFaceInset(lines, uiFace, 0.5f);
+        AppendFaceInset(lines, uiFace, 0.25f);
+        AppendVertexBoxFilled(lines, mesh.ComputeFaceCenter(uiFace), fMarker * 0.28f);
       }
     }
   }

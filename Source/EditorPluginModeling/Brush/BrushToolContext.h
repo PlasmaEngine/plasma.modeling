@@ -133,8 +133,9 @@ private:
   void ClearOverlays();
   void AppendVertexBox(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
   void AppendVertexBoxFilled(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
+  void AppendEdgeBar(plDynamicArray<plVec3>& ref_lines, const plVec3& v0, const plVec3& v1, float fRadius) const;
   void AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
-  void AppendFaceStar(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
+  void AppendFaceInset(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace, float fInset) const;
   void AppendWireframe(plDynamicArray<plVec3>& ref_lines) const;
   float GetMarkerSize() const;
 
