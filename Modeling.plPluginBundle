@@ -1,0 +1,21 @@
+// for a description of the options see:
+// Code/EditorPlugins/Assets/EditorPluginAssets/Assets.plPluginBundle
+
+PluginInfo
+{
+	string %DisplayName{"Modeling"}
+	string %Category{"Tools"}
+	string %MinEngineVersion{"0.8.0"}
+	string %MaxEngineVersion{"0.8.0"}
+	string %Icon{"ModelingIcon.png"}
+	string %Banner{"ModelingBanner.png"}
+	string %Description{"In-editor modeling and blockout tools: parametric brush shapes with per-face materials that render, collide and bake into the navmesh - drawn directly in the level with the Brush tool (B)."}
+	string %EditorPlugins{"plEditorPluginModeling"}
+	string %EditorEnginePlugins{}
+	string %RuntimePlugins{"plModelingPlugin"}
+	string %PackageDependencies{}
+	string %RequiredPlugins{}
+	string %ExclusiveFeatures{}
+	string %EnabledInTemplates{}
+	string %PlasmaBuildTargetName{"ModelingPlugin"}
+}

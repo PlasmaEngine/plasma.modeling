@@ -1,0 +1,50 @@
+// plasma.modeling — in-editor modeling & blockout toolset.
+//
+// The AUTHORED manifest, kept in source next to the plugin. It declares identity, compatibility,
+// what to load and what to ship. Component hashes and sizes are NOT here: the packaging step
+// computes those and emits them into the published manifest that ships inside the .plpkg.
+//
+// Design plan: PlasmaEngine2/Documentation/modeling-blockout-plan.html.
+
+PackageInfo
+{
+	// ---- identity -------------------------------------------------------------
+	// 0.x while the toolset is under construction: 0.1.0 is P1, blockout parity —
+	// parametric brush shapes with per-face materials. 1.0.0 when sub-object
+	// editing (P2) and CSG (P3) land.
+	string %Id{"plasma.modeling"}
+	string %Version{"0.1.0"}
+	string %Publisher{"PlasmaTechnology"}
+	string %License{"MIT"}
+	string %Homepage{"https://plasmagameengine.com"}
+
+	// ---- compatibility --------------------------------------------------------
+	string %MinEngineVersion{"0.8.0"}
+	string %MaxEngineVersion{"0.8.0"}
+	string %AbiTag{"win64-msvc19-0.8.0-dev"}
+
+	// ---- presentation ---------------------------------------------------------
+	string %DisplayName{"Modeling"}
+	string %Category{"Tools"}
+	string %Description{"In-editor modeling and blockout tools. Draw parametric brush shapes (box, ramp, column, stairs, arch, spiral) directly in the level with the Brush tool, assign materials per face, and the geometry renders, collides, occludes and bakes into the navmesh - no asset files involved.
+
+Currently P1 of the plan: blockout parity with per-face material slots. Sub-object editing, CSG carving and polygon operations land in later milestones."}
+	string %Icon{"Branding/ModelingIcon.png"}
+	string %Banner{"Branding/ModelingBanner.png"}
+
+	// ---- binaries -------------------------------------------------------------
+	// Two plugins: the runtime (mesh core, generators, brush component - the only
+	// module a shipped game needs) and the editor UI. The engine-process plugin
+	// arrives with P2's preview channel.
+	string %EditorPlugins{"plEditorPluginModeling"}
+	string %EditorEnginePlugins{}
+	string %RuntimePlugins{"plModelingPlugin"}
+	string %PackageDependencies{}
+
+	// ---- components -----------------------------------------------------------
+	Component { string %Name{"manifest"} string %Platform{"any"} }
+	Component { string %Name{"runtime-win64"} string %Platform{"win64"} }
+	Component { string %Name{"editor-win64"} string %Platform{"win64"} }
+	Component { string %Name{"icon"} string %Platform{"any"} }
+	Component { string %Name{"banner"} string %Platform{"any"} }
+}
