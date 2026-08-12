@@ -131,7 +131,8 @@ private:
   // overlays
   void UpdateOverlays();
   void ClearOverlays();
-  void AppendVertexMarker(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
+  void AppendVertexBox(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
+  void AppendVertexBoxFilled(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
   void AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
   void AppendFaceStar(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
   void AppendWireframe(plDynamicArray<plVec3>& ref_lines) const;

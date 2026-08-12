@@ -5,6 +5,10 @@
 #include <EditorPluginModeling/Brush/BrushToolContext.h>
 #include <EditorPluginModeling/EditorPluginModelingDLL.h>
 
+#include <QPointer>
+
+class plQtBrushModeStrip;
+
 struct plGameObjectEvent;
 struct plManipulatorManagerEvent;
 
@@ -42,6 +46,10 @@ private:
   void ManipulatorManagerEventHandler(const plManipulatorManagerEvent& e);
   void GizmoEventHandler(const plGizmoEvent& e);
 
+  void CreateModeStrips();
+  void DestroyModeStrips();
+
   plDrawBoxGizmo m_DrawBoxGizmo;
   plBrushToolContext m_ToolContext; ///< all brush input; forwards to the draw gizmo in Object mode
+  plHybridArray<QPointer<plQtBrushModeStrip>, 4> m_ModeStrips; ///< one per view widget while active
 };

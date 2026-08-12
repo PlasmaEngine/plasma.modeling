@@ -21,10 +21,11 @@ plEvent<const plBrushModeEvent&> plBrushToolContext::s_ModeEvents;
 
 plBrushToolContext::plBrushToolContext()
 {
-  // three overlay layers: dim = selectable, orange = selected, teal = hovered
+  // three overlay layers, the mockup's language: grey = selectable, teal-green fill = selected,
+  // white = hovered
   m_hCandidateLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(130, 135, 150), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
-  m_hSelectionLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(255, 160, 32), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
-  m_hHoverLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(6, 250, 201), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
+  m_hSelectionLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(6, 250, 201), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
+  m_hHoverLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(235, 240, 250), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
 
   SetVisible(false);
   SetTransformation(plTransform::MakeIdentity());
@@ -937,8 +938,47 @@ float plBrushToolContext::GetMarkerSize() const
   return plMath::Clamp(bbox.GetHalfExtents().GetLength() * 0.03f, 0.02f, 0.25f);
 }
 
-void plBrushToolContext::AppendVertexMarker(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const
+void plBrushToolContext::AppendVertexBox(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const
 {
+  // a small wire cube reads as the mockup's square vertex handle from every camera angle
+  const plVec3 c[8] = {
+    vPos + plVec3(-fSize, -fSize, -fSize),
+    vPos + plVec3(fSize, -fSize, -fSize),
+    vPos + plVec3(fSize, fSize, -fSize),
+    vPos + plVec3(-fSize, fSize, -fSize),
+    vPos + plVec3(-fSize, -fSize, fSize),
+    vPos + plVec3(fSize, -fSize, fSize),
+    vPos + plVec3(fSize, fSize, fSize),
+    vPos + plVec3(-fSize, fSize, fSize),
+  };
+
+  const plUInt32 edges[12][2] = {
+    {0, 1}, {1, 2}, {2, 3}, {3, 0}, // bottom
+    {4, 5}, {5, 6}, {6, 7}, {7, 4}, // top
+    {0, 4}, {1, 5}, {2, 6}, {3, 7}, // sides
+  };
+
+  for (const auto& edge : edges)
+  {
+    ref_lines.PushBack(c[edge[0]]);
+    ref_lines.PushBack(c[edge[1]]);
+  }
+}
+
+void plBrushToolContext::AppendVertexBoxFilled(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const
+{
+  AppendVertexBox(ref_lines, vPos, fSize);
+
+  // body diagonals + axis cross make the box read as solid ("fills" when selected)
+  ref_lines.PushBack(vPos + plVec3(-fSize, -fSize, -fSize));
+  ref_lines.PushBack(vPos + plVec3(fSize, fSize, fSize));
+  ref_lines.PushBack(vPos + plVec3(fSize, -fSize, -fSize));
+  ref_lines.PushBack(vPos + plVec3(-fSize, fSize, fSize));
+  ref_lines.PushBack(vPos + plVec3(fSize, fSize, -fSize));
+  ref_lines.PushBack(vPos + plVec3(-fSize, -fSize, fSize));
+  ref_lines.PushBack(vPos + plVec3(-fSize, fSize, -fSize));
+  ref_lines.PushBack(vPos + plVec3(fSize, -fSize, fSize));
+
   ref_lines.PushBack(vPos - plVec3(fSize, 0, 0));
   ref_lines.PushBack(vPos + plVec3(fSize, 0, 0));
   ref_lines.PushBack(vPos - plVec3(0, fSize, 0));
@@ -1032,7 +1072,7 @@ void plBrushToolContext::UpdateOverlays()
   {
     for (const plVec3& v : mesh.m_Vertices)
     {
-      AppendVertexMarker(lines, v, fMarker * 0.45f);
+      AppendVertexBox(lines, v, fMarker * 0.35f);
     }
   }
 
@@ -1054,7 +1094,7 @@ void plBrushToolContext::UpdateOverlays()
   {
     if (m_SubMode == plBrushSubMode::Vertex && m_Hover.m_iVertex >= 0)
     {
-      AppendVertexMarker(lines, mesh.m_Vertices[m_Hover.m_iVertex], fMarker);
+      AppendVertexBox(lines, mesh.m_Vertices[m_Hover.m_iVertex], fMarker * 0.5f);
     }
     else if (m_SubMode == plBrushSubMode::Edge && m_Hover.m_iEdgeV0 >= 0)
     {
@@ -1086,7 +1126,7 @@ void plBrushToolContext::UpdateOverlays()
   {
     if (uiVertex < mesh.m_Vertices.GetCount())
     {
-      AppendVertexMarker(lines, mesh.m_Vertices[uiVertex], fMarker * 0.8f);
+      AppendVertexBoxFilled(lines, mesh.m_Vertices[uiVertex], fMarker * 0.45f);
     }
   }
 

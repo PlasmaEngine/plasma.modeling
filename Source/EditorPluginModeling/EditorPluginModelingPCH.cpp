@@ -12,4 +12,5 @@ PL_STATICLINK_LIBRARY(EditorPluginModeling)
   PL_STATICLINK_REFERENCE(EditorPluginModeling_Brush_BrushFaceMaterialDragDropHandler);
   PL_STATICLINK_REFERENCE(EditorPluginModeling_Brush_ModelingPanel);
   PL_STATICLINK_REFERENCE(EditorPluginModeling_Brush_BrushToolContext);
+  PL_STATICLINK_REFERENCE(EditorPluginModeling_Brush_BrushModeStrip);
 }

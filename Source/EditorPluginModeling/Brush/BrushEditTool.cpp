@@ -7,6 +7,7 @@
 #include <EditorFramework/Panels/AssetBrowserPanel/AssetBrowserPanel.moc.h>
 #include <EditorFramework/Preferences/ScenePreferences.h>
 #include <EditorPluginModeling/Brush/BrushEditTool.h>
+#include <EditorPluginModeling/Brush/BrushModeStrip.moc.h>
 #include <GuiFoundation/PropertyGrid/ManipulatorManager.h>
 #include <ToolsFoundation/Command/TreeCommands.h>
 
@@ -141,12 +142,38 @@ void plBrushEditTool::OnActiveChanged(bool bIsActive)
   if (bIsActive)
   {
     m_DrawBoxGizmo.UpdateStatusBarText(GetWindow());
+    CreateModeStrips();
   }
   else
   {
     // leaving the tool ends any sub-object session; the next activation starts in draw mode
     m_ToolContext.SetSubMode(plBrushSubMode::Object);
+    DestroyModeStrips();
   }
+}
+
+void plBrushEditTool::CreateModeStrips()
+{
+  // recreated on every activation: the window's view set can change (single <-> quad view)
+  DestroyModeStrips();
+
+  for (plQtEngineViewWidget* pView : GetWindow()->GetViewWidgets())
+  {
+    m_ModeStrips.PushBack(new plQtBrushModeStrip(pView, &m_ToolContext));
+  }
+}
+
+void plBrushEditTool::DestroyModeStrips()
+{
+  for (const QPointer<plQtBrushModeStrip>& pStrip : m_ModeStrips)
+  {
+    if (pStrip)
+    {
+      pStrip->deleteLater();
+    }
+  }
+
+  m_ModeStrips.Clear();
 }
 
 void plBrushEditTool::GizmoEventHandler(const plGizmoEvent& e)
