@@ -8,8 +8,11 @@ class plDocument;
 class plQtDocumentWindow;
 class QButtonGroup;
 
-/// \brief The Modeling dock panel: a primitive palette that presets the shape for the next drawn brush
-/// and re-shapes the currently selected ones.
+struct plGameObjectEvent;
+
+/// \brief The Modeling dock panel: a primitive palette. Clicking a shape arms the Brush draw tool with
+/// it — the next click in the viewport starts drawing that primitive. The checked button doubles as the
+/// mode indicator and clears when the tool deactivates.
 ///
 /// Docks as a tab beside Properties in scene windows. Created by the panel manager on a window's first
 /// BeforeRedraw — plQtDocumentWindow has no window-created event, and the scene window builds its own
@@ -26,7 +29,8 @@ private Q_SLOTS:
   void OnShapeButtonClicked(int iShape);
 
 private:
-  void ApplyShapeToSelection(int iShape);
+  void GameObjectEventHandler(const plGameObjectEvent& e);
+  void UncheckAllButtons();
 
   plDocument* m_pDocument = nullptr;
   QButtonGroup* m_pShapeButtons = nullptr;

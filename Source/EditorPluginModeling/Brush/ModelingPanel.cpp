@@ -4,7 +4,6 @@
 #include <EditorPluginModeling/Brush/BrushEditTool.h>
 #include <EditorPluginModeling/Brush/ModelingPanel.moc.h>
 #include <ModelingPlugin/Modeling/BrushGenerators.h>
-#include <ToolsFoundation/Object/ObjectAccessorBase.h>
 
 #include <QButtonGroup>
 #include <QGridLayout>
@@ -61,7 +60,6 @@ plQtModelingPanel::plQtModelingPanel(plQtDocumentWindow* pWindow, plDocument* pD
   {
     QPushButton* pButton = new QPushButton(c_Shapes[i].m_szLabel, pContent);
     pButton->setCheckable(true);
-    pButton->setChecked(c_Shapes[i].m_Shape == plBrushToolSettings::s_iPendingShape);
 
     m_pShapeButtons->addButton(pButton, static_cast<int>(c_Shapes[i].m_Shape));
     pGrid->addWidget(pButton, i / 3, i % 3);
@@ -69,7 +67,7 @@ plQtModelingPanel::plQtModelingPanel(plQtDocumentWindow* pWindow, plDocument* pD
 
   pLayout->addLayout(pGrid);
 
-  QLabel* pHint = new QLabel("Press B and drag in the viewport to draw.\nClicking a shape also re-shapes the\nselected brushes.", pContent);
+  QLabel* pHint = new QLabel("Click a shape, then drag in the viewport\nto draw it. Esc or a gizmo leaves draw\nmode. Shape edits: Properties panel.", pContent);
   pHint->setWordWrap(true);
   pHint->setStyleSheet("color: #8a8a8a; font-size: 10px;");
   pLayout->addWidget(pHint);
@@ -79,59 +77,61 @@ plQtModelingPanel::plQtModelingPanel(plQtDocumentWindow* pWindow, plDocument* pD
   setWidget(pContent);
 
   connect(m_pShapeButtons, &QButtonGroup::idClicked, this, &plQtModelingPanel::OnShapeButtonClicked);
+
+  // the checked button is a mode indicator, so it has to clear when draw mode ends
+  if (plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument))
+  {
+    pGameDoc->m_GameObjectEvents.AddEventHandler(plMakeDelegate(&plQtModelingPanel::GameObjectEventHandler, this));
+  }
 }
 
-plQtModelingPanel::~plQtModelingPanel() = default;
+plQtModelingPanel::~plQtModelingPanel()
+{
+  if (plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument))
+  {
+    pGameDoc->m_GameObjectEvents.RemoveEventHandler(plMakeDelegate(&plQtModelingPanel::GameObjectEventHandler, this));
+  }
+}
 
 void plQtModelingPanel::OnShapeButtonClicked(int iShape)
 {
-  // the next drawn brush uses this shape
   plBrushToolSettings::s_iPendingShape = iShape;
 
-  ApplyShapeToSelection(iShape);
+  // arm the draw tool: the next click in the viewport starts drawing this primitive
+  if (plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument))
+  {
+    pGameDoc->SetActiveEditTool(plGetStaticRTTI<plBrushEditTool>());
+  }
 }
 
-void plQtModelingPanel::ApplyShapeToSelection(int iShape)
+void plQtModelingPanel::GameObjectEventHandler(const plGameObjectEvent& e)
 {
+  if (e.m_Type != plGameObjectEvent::Type::ActiveEditToolChanged)
+    return;
+
   plGameObjectDocument* pGameDoc = plDynamicCast<plGameObjectDocument*>(m_pDocument);
 
   if (pGameDoc == nullptr)
     return;
 
-  plObjectAccessorBase* pAccessor = pGameDoc->GetObjectAccessor();
-  const auto& selection = pGameDoc->GetSelectionManager()->GetSelection();
+  plGameObjectEditTool* pTool = pGameDoc->GetActiveEditTool();
 
-  bool bAny = false;
-
-  for (const plDocumentObject* pObject : selection)
+  if (pTool == nullptr || !pTool->GetDynamicRTTI()->IsDerivedFrom<plBrushEditTool>())
   {
-    // the selection holds game objects; the brush component hangs below them
-    for (const plDocumentObject* pChild : pObject->GetChildren())
-    {
-      const plRTTI* pType = pChild->GetTypeAccessor().GetType();
+    UncheckAllButtons();
+  }
+}
 
-      if (pType->GetTypeName() != "plBrushComponent")
-        continue;
+void plQtModelingPanel::UncheckAllButtons()
+{
+  m_pShapeButtons->setExclusive(false);
 
-      const plAbstractProperty* pShapeProp = pType->FindPropertyByName("Shape");
-
-      if (pShapeProp == nullptr)
-        continue;
-
-      if (!bAny)
-      {
-        pAccessor->StartTransaction("Change Brush Shape");
-        bAny = true;
-      }
-
-      pAccessor->SetValue(pChild, pShapeProp, static_cast<plInt64>(iShape)).AssertSuccess();
-    }
+  for (QAbstractButton* pButton : m_pShapeButtons->buttons())
+  {
+    pButton->setChecked(false);
   }
 
-  if (bAny)
-  {
-    pAccessor->FinishTransaction();
-  }
+  m_pShapeButtons->setExclusive(true);
 }
 
 //////////////////////////////////////////////////////////////////////////
