@@ -1,5 +1,6 @@
 #include <EditorPluginModeling/EditorPluginModelingPCH.h>
 
+#include <EditorEngineProcessFramework/EngineProcess/EngineProcessMessages.h>
 #include <EditorFramework/Document/GameObjectDocument.h>
 #include <EditorFramework/DocumentWindow/EngineDocumentWindow.moc.h>
 #include <EditorFramework/DocumentWindow/EngineViewWidget.moc.h>
@@ -27,17 +28,34 @@ plBrushToolContext::plBrushToolContext()
   m_hSelectionLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(6, 250, 201), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
   m_hHoverLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(235, 240, 250), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
 
+  m_TranslateGizmo.m_GizmoEvents.AddEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+  m_RotateGizmo.m_GizmoEvents.AddEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+  m_ScaleGizmo.m_GizmoEvents.AddEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+
   SetVisible(false);
   SetTransformation(plTransform::MakeIdentity());
 }
 
-plBrushToolContext::~plBrushToolContext() = default;
+plBrushToolContext::~plBrushToolContext()
+{
+  m_TranslateGizmo.m_GizmoEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+  m_RotateGizmo.m_GizmoEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+  m_ScaleGizmo.m_GizmoEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+}
 
 void plBrushToolContext::OnSetOwner(plQtEngineDocumentWindow* pOwnerWindow, plQtEngineViewWidget* pOwnerView)
 {
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hCandidateLines);
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hHoverLines);
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hSelectionLines);
+
+  m_TranslateGizmo.SetOwner(pOwnerWindow, nullptr);
+  m_RotateGizmo.SetOwner(pOwnerWindow, nullptr);
+  m_ScaleGizmo.SetOwner(pOwnerWindow, nullptr);
+
+  m_TranslateGizmo.SetVisible(false);
+  m_RotateGizmo.SetVisible(false);
+  m_ScaleGizmo.SetVisible(false);
 }
 
 void plBrushToolContext::DoFocusLost(bool bCancel)
@@ -367,9 +385,13 @@ void plBrushToolContext::SetSubMode(plBrushSubMode::Enum mode)
   {
     SetShortcutsDisabled(false);
     m_Hover.Reset();
+    HideGizmos();
   }
 
   m_SubMode = mode;
+
+  // each mode has its own selection set, so a visible gizmo must follow (or vanish)
+  RepositionGizmos();
 
   UpdateOverlays();
 
@@ -387,6 +409,226 @@ void plBrushToolContext::SetSubMode(plBrushSubMode::Enum mode)
 
 //////////////////////////////////////////////////////////////////////////
 // modal operations
+
+void plBrushToolContext::ApplyWorldTransformToSelection(const plVec3& vTranslate, const plQuat& qRotation, const plVec3& vScale)
+{
+  const plTransform invTransform = m_ObjectTransform.GetInverse();
+
+  m_PreviewMesh = m_BaseMesh;
+
+  for (plUInt32 uiVertex : m_ModalVertices)
+  {
+    const plVec3 vWorld = m_ObjectTransform.TransformPosition(m_BaseMesh.m_Vertices[uiVertex]);
+
+    plVec3 vFromPivot = vWorld - m_vPivot;
+    vFromPivot = qRotation * vFromPivot.CompMul(vScale);
+
+    m_PreviewMesh.m_Vertices[uiVertex] = invTransform.TransformPosition(m_vPivot + vFromPivot + vTranslate);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////
+// gizmo workflow (W / E / R)
+
+plGizmo* plBrushToolContext::GetActiveGizmoPtr()
+{
+  switch (m_ActiveGizmo)
+  {
+    case ActiveGizmo::Translate:
+      return &m_TranslateGizmo;
+    case ActiveGizmo::Rotate:
+      return &m_RotateGizmo;
+    case ActiveGizmo::Scale:
+      return &m_ScaleGizmo;
+    default:
+      return nullptr;
+  }
+}
+
+plResult plBrushToolContext::ComputeSelectionPivot(plVec3& out_vPivot)
+{
+  plHashSet<plUInt32> vertices;
+  GatherSelectedVertices(vertices);
+
+  if (vertices.IsEmpty())
+    return PL_FAILURE;
+
+  plVec3 vPivot = plVec3::MakeZero();
+
+  for (plUInt32 uiVertex : vertices)
+  {
+    vPivot += m_ObjectTransform.TransformPosition(m_BaseMesh.m_Vertices[uiVertex]);
+  }
+
+  out_vPivot = vPivot / static_cast<float>(vertices.GetCount());
+  return PL_SUCCESS;
+}
+
+void plBrushToolContext::ShowGizmo(ActiveGizmo::Enum which)
+{
+  if (!RebuildBaseMesh())
+    return;
+
+  plVec3 vPivot;
+
+  if (ComputeSelectionPivot(vPivot).Failed())
+  {
+    if (GetOwnerWindow())
+    {
+      GetOwnerWindow()->SetPermanentStatusBarMsg("Brush: nothing selected - click a vertex/edge/face first, then W/E/R for a gizmo.");
+    }
+
+    return;
+  }
+
+  m_ActiveGizmo = which;
+
+  // world-space orientation at the selection pivot
+  const plTransform transform(vPivot);
+
+  m_TranslateGizmo.SetVisible(which == ActiveGizmo::Translate);
+  m_RotateGizmo.SetVisible(which == ActiveGizmo::Rotate);
+  m_ScaleGizmo.SetVisible(which == ActiveGizmo::Scale);
+
+  if (plGizmo* pGizmo = GetActiveGizmoPtr())
+  {
+    pGizmo->SetTransformation(transform);
+  }
+
+  if (GetOwnerWindow())
+  {
+    UpdateStatusBarText(GetOwnerWindow());
+  }
+}
+
+void plBrushToolContext::HideGizmos()
+{
+  m_ActiveGizmo = ActiveGizmo::None;
+
+  m_TranslateGizmo.SetVisible(false);
+  m_RotateGizmo.SetVisible(false);
+  m_ScaleGizmo.SetVisible(false);
+
+  if (m_LastHighlightedHandle.IsValid())
+  {
+    m_LastHighlightedHandle = plUuid();
+
+    plViewHighlightMsgToEngine msg;
+    GetOwnerWindow()->GetEditorEngineConnection()->SendHighlightObjectMessage(&msg);
+  }
+}
+
+void plBrushToolContext::RepositionGizmos()
+{
+  if (m_ActiveGizmo == ActiveGizmo::None)
+    return;
+
+  plVec3 vPivot;
+
+  if (ComputeSelectionPivot(vPivot).Failed())
+  {
+    HideGizmos();
+    return;
+  }
+
+  if (plGizmo* pGizmo = GetActiveGizmoPtr())
+  {
+    pGizmo->SetTransformation(plTransform(vPivot));
+  }
+}
+
+void plBrushToolContext::GizmoEventHandler(const plGizmoEvent& e)
+{
+  switch (e.m_Type)
+  {
+    case plGizmoEvent::Type::BeginInteractions:
+    {
+      if (!RebuildBaseMesh())
+        return;
+
+      GatherSelectedVertices(m_ModalVertices);
+
+      if (m_ModalVertices.IsEmpty())
+        return;
+
+      m_PreviewMesh = m_BaseMesh;
+
+      if (plGizmo* pGizmo = GetActiveGizmoPtr())
+      {
+        m_GizmoStartTransform = pGizmo->GetTransformation();
+        m_vPivot = m_GizmoStartTransform.m_vPosition;
+      }
+
+      m_pDocument->GetCommandHistory()->BeginTemporaryCommands("Edit Brush", true);
+      m_bInTemporaryCommands = true;
+      break;
+    }
+
+    case plGizmoEvent::Type::Interaction:
+    {
+      if (!m_bInTemporaryCommands)
+        return;
+
+      plVec3 vTranslate = plVec3::MakeZero();
+      plQuat qRotation = plQuat::MakeIdentity();
+      plVec3 vScale = plVec3(1, 1, 1);
+
+      switch (m_ActiveGizmo)
+      {
+        case ActiveGizmo::Translate:
+          vTranslate = m_TranslateGizmo.GetTranslationResult();
+          break;
+        case ActiveGizmo::Rotate:
+          qRotation = m_RotateGizmo.GetRotationResult();
+          break;
+        case ActiveGizmo::Scale:
+          vScale = m_ScaleGizmo.GetScalingResult();
+          break;
+        default:
+          return;
+      }
+
+      ApplyWorldTransformToSelection(vTranslate, qRotation, vScale);
+      WritePreview(m_PreviewMesh, false);
+      UpdateOverlays();
+      break;
+    }
+
+    case plGizmoEvent::Type::EndInteractions:
+    {
+      if (m_bInTemporaryCommands)
+      {
+        m_pDocument->GetCommandHistory()->FinishTemporaryCommands();
+        m_bInTemporaryCommands = false;
+      }
+
+      m_BaseMesh = m_PreviewMesh;
+      RepositionGizmos();
+      UpdateOverlays();
+      break;
+    }
+
+    case plGizmoEvent::Type::CancelInteractions:
+    {
+      if (m_bInTemporaryCommands)
+      {
+        m_pDocument->GetCommandHistory()->CancelTemporaryCommands();
+        m_bInTemporaryCommands = false;
+      }
+
+      if (plGizmo* pGizmo = GetActiveGizmoPtr())
+      {
+        pGizmo->SetTransformation(m_GizmoStartTransform);
+      }
+
+      UpdateOverlays();
+      break;
+    }
+
+    default:
+      break;
+  }
+}
 
 plVec3 plBrushToolContext::GetAxisVector() const
 {
@@ -505,9 +747,6 @@ void plBrushToolContext::UpdateModalPreview()
 
   const plVec3 vAxis = GetAxisVector();
 
-  // the preview is always recomputed from the base mesh, so input parameter changes never accumulate
-  m_PreviewMesh = m_BaseMesh;
-
   plVec3 vDelta = plVec3::MakeZero();
   plQuat qRotation = plQuat::MakeIdentity();
   float fScale = 1.0f;
@@ -570,46 +809,14 @@ void plBrushToolContext::UpdateModalPreview()
     }
   }
 
-  // ops run in world space: local -> world, transform, world -> local
-  const plTransform invTransform = m_ObjectTransform.GetInverse();
+  plVec3 vScaleVec(1, 1, 1);
 
-  for (plUInt32 uiVertex : m_ModalVertices)
+  if (m_ModalOp == ModalOp::Scale)
   {
-    plVec3 vWorld = m_ObjectTransform.TransformPosition(m_BaseMesh.m_Vertices[uiVertex]);
-
-    switch (m_ModalOp)
-    {
-      case ModalOp::Move:
-        vWorld += vDelta;
-        break;
-
-      case ModalOp::Rotate:
-        vWorld = m_vPivot + qRotation * (vWorld - m_vPivot);
-        break;
-
-      case ModalOp::Scale:
-      {
-        plVec3 vFromPivot = vWorld - m_vPivot;
-
-        if (vAxis.IsZero())
-        {
-          vFromPivot *= fScale;
-        }
-        else
-        {
-          vFromPivot += vAxis * ((fScale - 1.0f) * vAxis.Dot(vFromPivot));
-        }
-
-        vWorld = m_vPivot + vFromPivot;
-        break;
-      }
-
-      default:
-        break;
-    }
-
-    m_PreviewMesh.m_Vertices[uiVertex] = invTransform.TransformPosition(vWorld);
+    vScaleVec = vAxis.IsZero() ? plVec3(fScale) : plVec3(1, 1, 1) + vAxis * (fScale - 1.0f);
   }
+
+  ApplyWorldTransformToSelection(vDelta, qRotation, vScaleVec);
 
   WritePreview(m_PreviewMesh, false);
   UpdateOverlays();
@@ -805,11 +1012,22 @@ plEditorInput plBrushToolContext::DoKeyPressEvent(QKeyEvent* e)
     case Qt::Key_G:
       BeginModalOp(ModalOp::Move);
       return plEditorInput::WasExclusivelyHandled;
-    case Qt::Key_R:
-      BeginModalOp(ModalOp::Rotate);
-      return plEditorInput::WasExclusivelyHandled;
     case Qt::Key_S:
       BeginModalOp(ModalOp::Scale);
+      return plEditorInput::WasExclusivelyHandled;
+
+    // the editor's standard gizmo keys, retargeted at the sub-object selection
+    case Qt::Key_W:
+      ShowGizmo(ActiveGizmo::Translate);
+      return plEditorInput::WasExclusivelyHandled;
+    case Qt::Key_E:
+      ShowGizmo(ActiveGizmo::Rotate);
+      return plEditorInput::WasExclusivelyHandled;
+    case Qt::Key_R:
+      ShowGizmo(ActiveGizmo::Scale);
+      return plEditorInput::WasExclusivelyHandled;
+    case Qt::Key_Q:
+      HideGizmos();
       return plEditorInput::WasExclusivelyHandled;
 
     default:
@@ -855,9 +1073,35 @@ plEditorInput plBrushToolContext::DoMousePressEvent(QMouseEvent* e)
 
   if (e->button() == Qt::LeftButton)
   {
+    // a click on an active gizmo handle belongs to the gizmo, not to selection
+    if (m_ActiveGizmo != ActiveGizmo::None)
+    {
+      const plObjectPickingResult& res = GetOwnerView()->PickObject(static_cast<plUInt16>(e->pos().x()), static_cast<plUInt16>(e->pos().y()));
+
+      if (res.m_PickedOther.IsValid())
+      {
+        if (auto* pSO = GetOwnerWindow()->GetDocument()->FindSyncObject(res.m_PickedOther))
+        {
+          if (pSO->GetDynamicRTTI()->IsDerivedFrom<plGizmoHandle>())
+          {
+            plGizmoHandle* pHandle = static_cast<plGizmoHandle*>(pSO);
+            plGizmo* pGizmo = pHandle->GetOwnerGizmo();
+
+            if (pGizmo == GetActiveGizmoPtr())
+            {
+              plQtEngineViewWidget* pView = GetOwnerView();
+              pGizmo->ConfigureInteraction(pHandle, &pView->m_pViewConfig->m_Camera, res.m_vPickedPosition, plVec2I32(pView->width(), pView->height()));
+              return pGizmo->MousePressEvent(e);
+            }
+          }
+        }
+      }
+    }
+
     HoverHit hit;
     PickAt(e->pos(), hit);
     ApplyClickSelection(hit, e->modifiers().testFlag(Qt::ShiftModifier));
+    RepositionGizmos();
     UpdateOverlays();
 
     if (GetOwnerWindow())
@@ -904,6 +1148,46 @@ plEditorInput plBrushToolContext::DoMouseMoveEvent(QMouseEvent* e)
   // let camera drags and rubber bands through
   if (e->buttons() != Qt::NoButton)
     return plEditorInput::MayBeHandledByOthers;
+
+  // gizmo handles highlight on hover, exactly as they do for the transform tools
+  if (m_ActiveGizmo != ActiveGizmo::None)
+  {
+    const plObjectPickingResult& res = GetOwnerView()->PickObject(static_cast<plUInt16>(e->pos().x()), static_cast<plUInt16>(e->pos().y()));
+
+    plUuid hoveredHandle;
+
+    if (res.m_PickedOther.IsValid())
+    {
+      if (auto* pSO = GetOwnerWindow()->GetDocument()->FindSyncObject(res.m_PickedOther))
+      {
+        if (pSO->GetDynamicRTTI()->IsDerivedFrom<plGizmoHandle>() && static_cast<plGizmoHandle*>(pSO)->GetOwnerGizmo() == GetActiveGizmoPtr())
+        {
+          hoveredHandle = res.m_PickedOther;
+        }
+      }
+    }
+
+    if (hoveredHandle != m_LastHighlightedHandle)
+    {
+      m_LastHighlightedHandle = hoveredHandle;
+
+      plViewHighlightMsgToEngine msg;
+      msg.m_HighlightObject = hoveredHandle;
+      GetOwnerWindow()->GetEditorEngineConnection()->SendHighlightObjectMessage(&msg);
+    }
+
+    if (hoveredHandle.IsValid())
+    {
+      // the cursor is on the gizmo — no brush hover underneath it
+      if (m_Hover.IsValid())
+      {
+        m_Hover.Reset();
+        UpdateOverlays();
+      }
+
+      return plEditorInput::WasExclusivelyHandled;
+    }
+  }
 
   HoverHit previous = m_Hover;
 
@@ -1241,13 +1525,13 @@ void plBrushToolContext::UpdateStatusBarText(plQtEngineDocumentWindow* pWindow)
   switch (m_SubMode)
   {
     case plBrushSubMode::Vertex:
-      pWindow->SetPermanentStatusBarMsg(plFmt("Brush - Vertex mode: click to select ({} selected, SHIFT adds) - G move, R rotate, S scale - 2 edges, 3 faces, ESC object mode.", m_SelectedVertices.GetCount()));
+      pWindow->SetPermanentStatusBarMsg(plFmt("Brush - Vertex mode ({} selected): click selects, SHIFT adds - W/E/R move/rotate/scale gizmo, Q hides - G grab, S scale (X/Y/Z lock, type a value) - 2 edges, 3 faces, ESC object mode.", m_SelectedVertices.GetCount()));
       break;
     case plBrushSubMode::Edge:
-      pWindow->SetPermanentStatusBarMsg(plFmt("Brush - Edge mode: click to select ({} selected, SHIFT adds) - G move, R rotate, S scale - 1 vertices, 3 faces, ESC object mode.", m_SelectedEdges.GetCount()));
+      pWindow->SetPermanentStatusBarMsg(plFmt("Brush - Edge mode ({} selected): click selects, SHIFT adds - W/E/R move/rotate/scale gizmo, Q hides - G grab, S scale (X/Y/Z lock, type a value) - 1 vertices, 3 faces, ESC object mode.", m_SelectedEdges.GetCount()));
       break;
     case plBrushSubMode::Face:
-      pWindow->SetPermanentStatusBarMsg(plFmt("Brush - Face mode: click to select ({} selected, SHIFT adds) - G move, R rotate, S scale - 1 vertices, 2 edges, ESC object mode.", m_SelectedFaces.GetCount()));
+      pWindow->SetPermanentStatusBarMsg(plFmt("Brush - Face mode ({} selected): click selects, SHIFT adds - W/E/R move/rotate/scale gizmo, Q hides - G grab, S scale (X/Y/Z lock, type a value) - 1 vertices, 2 edges, ESC object mode.", m_SelectedFaces.GetCount()));
       break;
     default:
       pWindow->SetPermanentStatusBarMsg("Brush: drag to draw - 1/2/3 for vertex/edge/face editing of the selected brush.");

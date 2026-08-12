@@ -1,6 +1,9 @@
 #pragma once
 
 #include <EditorFramework/Gizmos/GizmoBase.h>
+#include <EditorFramework/Gizmos/RotateGizmo.h>
+#include <EditorFramework/Gizmos/ScaleGizmo.h>
+#include <EditorFramework/Gizmos/TranslateGizmo.h>
 #include <EditorPluginModeling/EditorPluginModelingDLL.h>
 #include <Foundation/Containers/HashSet.h>
 #include <ModelingPlugin/Modeling/EditableMesh.h>
@@ -118,6 +121,17 @@ private:
   void GatherSelectedVertices(plHashSet<plUInt32>& out_vertices) const;
   static plUInt64 MakeEdgeKey(plUInt32 uiV0, plUInt32 uiV1);
 
+  struct ActiveGizmo
+  {
+    enum Enum
+    {
+      None,
+      Translate,
+      Rotate,
+      Scale,
+    };
+  };
+
   // modal operation
   void BeginModalOp(ModalOp::Enum op);
   void UpdateModalPreview();
@@ -127,6 +141,18 @@ private:
   void WritePreview(const plEditableMesh& mesh, bool bFinal);
   plResult PickOnWorkPlane(const QPoint& viewPos, plVec3& out_vPoint) const;
   plVec3 GetAxisVector() const;
+
+  /// Rebuilds the preview from the base mesh: rotate/scale around m_vPivot, then translate — in
+  /// world space. Shared by the modal ops and the gizmo drags.
+  void ApplyWorldTransformToSelection(const plVec3& vTranslate, const plQuat& qRotation, const plVec3& vScale);
+
+  // gizmo workflow (W / E / R)
+  void ShowGizmo(ActiveGizmo::Enum which);
+  void HideGizmos();
+  void RepositionGizmos();
+  plGizmo* GetActiveGizmoPtr();
+  void GizmoEventHandler(const plGizmoEvent& e);
+  plResult ComputeSelectionPivot(plVec3& out_vPivot);
 
   // overlays
   void UpdateOverlays();
@@ -170,4 +196,12 @@ private:
   plEngineGizmoHandle m_hHoverLines;
   plEngineGizmoHandle m_hSelectionLines;
   plEngineGizmoHandle m_hCandidateLines; ///< what CAN be selected: wireframe + per-mode markers, dim
+
+  // gizmo state
+  ActiveGizmo::Enum m_ActiveGizmo = ActiveGizmo::None;
+  plTranslateGizmo m_TranslateGizmo;
+  plRotateGizmo m_RotateGizmo;
+  plScaleGizmo m_ScaleGizmo;
+  plTransform m_GizmoStartTransform = plTransform::MakeIdentity();
+  plUuid m_LastHighlightedHandle;
 };
