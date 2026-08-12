@@ -133,6 +133,8 @@ private:
   void ClearOverlays();
   void AppendVertexMarker(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
   void AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
+  void AppendFaceStar(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
+  void AppendWireframe(plDynamicArray<plVec3>& ref_lines) const;
   float GetMarkerSize() const;
 
   plDrawBoxGizmo* m_pDrawGizmo = nullptr;
@@ -165,4 +167,5 @@ private:
 
   plEngineGizmoHandle m_hHoverLines;
   plEngineGizmoHandle m_hSelectionLines;
+  plEngineGizmoHandle m_hCandidateLines; ///< what CAN be selected: wireframe + per-mode markers, dim
 };

@@ -21,8 +21,10 @@ plEvent<const plBrushModeEvent&> plBrushToolContext::s_ModeEvents;
 
 plBrushToolContext::plBrushToolContext()
 {
-  m_hHoverLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(6, 250, 201), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
+  // three overlay layers: dim = selectable, orange = selected, teal = hovered
+  m_hCandidateLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(130, 135, 150), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
   m_hSelectionLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(255, 160, 32), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
+  m_hHoverLines.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, plColorLinearUB(6, 250, 201), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
 
   SetVisible(false);
   SetTransformation(plTransform::MakeIdentity());
@@ -32,6 +34,7 @@ plBrushToolContext::~plBrushToolContext() = default;
 
 void plBrushToolContext::OnSetOwner(plQtEngineDocumentWindow* pOwnerWindow, plQtEngineViewWidget* pOwnerView)
 {
+  pOwnerWindow->GetDocument()->AddSyncObject(&m_hCandidateLines);
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hHoverLines);
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hSelectionLines);
 }
@@ -956,8 +959,54 @@ void plBrushToolContext::AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, pl
   }
 }
 
+void plBrushToolContext::AppendFaceStar(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const
+{
+  // corner-to-centroid star: reads as a "filled" face with a line-only overlay
+  const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
+  const plBrushFace& face = mesh.m_Faces[uiFace];
+
+  plVec3 vCenter = plVec3::MakeZero();
+
+  for (plUInt32 uiCorner : face.m_Corners)
+  {
+    vCenter += mesh.m_Vertices[uiCorner];
+  }
+
+  vCenter /= static_cast<float>(face.m_Corners.GetCount());
+
+  for (plUInt32 uiCorner : face.m_Corners)
+  {
+    ref_lines.PushBack(mesh.m_Vertices[uiCorner]);
+    ref_lines.PushBack(vCenter);
+  }
+}
+
+void plBrushToolContext::AppendWireframe(plDynamicArray<plVec3>& ref_lines) const
+{
+  // every unique edge once — the structure of what is editable
+  const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
+
+  plHashSet<plUInt64> edges;
+
+  for (const plBrushFace& face : mesh.m_Faces)
+  {
+    for (plUInt32 i = 0; i < face.m_Corners.GetCount(); ++i)
+    {
+      const plUInt32 uiV0 = face.m_Corners[i];
+      const plUInt32 uiV1 = face.m_Corners[(i + 1) % face.m_Corners.GetCount()];
+
+      if (!edges.Insert(MakeEdgeKey(uiV0, uiV1)))
+      {
+        ref_lines.PushBack(mesh.m_Vertices[uiV0]);
+        ref_lines.PushBack(mesh.m_Vertices[uiV1]);
+      }
+    }
+  }
+}
+
 void plBrushToolContext::ClearOverlays()
 {
+  m_hCandidateLines.SetVisible(false);
   m_hHoverLines.SetVisible(false);
   m_hSelectionLines.SetVisible(false);
 }
@@ -975,7 +1024,32 @@ void plBrushToolContext::UpdateOverlays()
 
   plDynamicArray<plVec3> lines;
 
+  // candidates: the wireframe shows the editable structure in every mode; vertex mode
+  // additionally marks every vertex so the selectable set is unmistakable
+  AppendWireframe(lines);
+
+  if (m_SubMode == plBrushSubMode::Vertex)
+  {
+    for (const plVec3& v : mesh.m_Vertices)
+    {
+      AppendVertexMarker(lines, v, fMarker * 0.45f);
+    }
+  }
+
+  if (lines.IsEmpty())
+  {
+    m_hCandidateLines.SetVisible(false);
+  }
+  else
+  {
+    m_hCandidateLines.SetLines(lines);
+    m_hCandidateLines.SetTransformation(m_ObjectTransform);
+    m_hCandidateLines.SetVisible(true);
+  }
+
   // hover
+  lines.Clear();
+
   if (m_Hover.IsValid() && m_ModalOp == ModalOp::None)
   {
     if (m_SubMode == plBrushSubMode::Vertex && m_Hover.m_iVertex >= 0)
@@ -990,6 +1064,7 @@ void plBrushToolContext::UpdateOverlays()
     else if (m_SubMode == plBrushSubMode::Face)
     {
       AppendFaceOutline(lines, static_cast<plUInt32>(m_Hover.m_iFace));
+      AppendFaceStar(lines, static_cast<plUInt32>(m_Hover.m_iFace));
     }
   }
 
@@ -1034,6 +1109,7 @@ void plBrushToolContext::UpdateOverlays()
       if (mesh.m_Faces[uiFace].m_uiFaceId == uiFaceId)
       {
         AppendFaceOutline(lines, uiFace);
+        AppendFaceStar(lines, uiFace);
       }
     }
   }
