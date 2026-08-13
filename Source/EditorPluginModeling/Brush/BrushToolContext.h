@@ -169,7 +169,6 @@ private:
   void ClearOverlays();
   void AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
   void AppendFaceInset(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace, float fInset) const;
-  void AppendWireframe(plDynamicArray<plVec3>& ref_lines) const;
 
   // element cube handles — the greybox-manipulator visual: solid constant-size cubes on every
   // selectable element (vertex / edge midpoint / face center), grey when idle, brand when selected,

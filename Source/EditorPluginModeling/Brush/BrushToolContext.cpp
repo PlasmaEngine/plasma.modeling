@@ -1299,36 +1299,10 @@ plEditorInput plBrushToolContext::DoMouseMoveEvent(QMouseEvent* e)
       return plEditorInput::WasExclusivelyHandled;
     }
 
-    if (uiElement != plInvalidIndex)
-    {
-      // hovering a cube hovers its element — precise, no surface pick involved
-      HoverHit previous = m_Hover;
-
-      if (!MakeHoverFromElement(uiElement, m_Hover))
-      {
-        m_Hover.Reset();
-      }
-
-      if (plMemoryUtils::Compare(&previous, &m_Hover, 1) != 0)
-      {
-        UpdateOverlays();
-      }
-
-      return plEditorInput::WasExclusivelyHandled;
-    }
+    // hover feedback is the engine highlight on the cube alone — no lines until something is selected
   }
 
-  HoverHit previous = m_Hover;
-
-  if (!PickAt(e->pos(), m_Hover))
-  {
-    m_Hover.Reset();
-  }
-
-  if (plMemoryUtils::Compare(&previous, &m_Hover, 1) != 0)
-  {
-    UpdateOverlays();
-  }
+  m_Hover.Reset();
 
   return plEditorInput::WasExclusivelyHandled;
 }
@@ -1559,29 +1533,6 @@ void plBrushToolContext::AppendFaceInset(plDynamicArray<plVec3>& ref_lines, plUI
   }
 }
 
-void plBrushToolContext::AppendWireframe(plDynamicArray<plVec3>& ref_lines) const
-{
-  // every unique edge once — the structure of what is editable
-  const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
-
-  plHashSet<plUInt64> edges;
-
-  for (const plBrushFace& face : mesh.m_Faces)
-  {
-    for (plUInt32 i = 0; i < face.m_Corners.GetCount(); ++i)
-    {
-      const plUInt32 uiV0 = face.m_Corners[i];
-      const plUInt32 uiV1 = face.m_Corners[(i + 1) % face.m_Corners.GetCount()];
-
-      if (!edges.Insert(MakeEdgeKey(uiV0, uiV1)))
-      {
-        ref_lines.PushBack(mesh.m_Vertices[uiV0]);
-        ref_lines.PushBack(mesh.m_Vertices[uiV1]);
-      }
-    }
-  }
-}
-
 void plBrushToolContext::ClearOverlays()
 {
   m_hCandidateLines.SetVisible(false);
@@ -1601,54 +1552,15 @@ void plBrushToolContext::UpdateOverlays()
 
   const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
 
-  // the cubes are the selection UI (grey = selectable, brand = selected, highlight = hovered);
-  // the line layers stay as thin structural accents around them
+  // the cubes ARE the idle UI: grey = selectable, engine highlight = hovered, brand = selected.
+  // Lines appear only for selected elements, so the viewport stays clean until a choice is made.
   UpdateElementHandles();
 
-  plDynamicArray<plVec3> lines;
-
-  AppendWireframe(lines);
-
-  if (lines.IsEmpty())
-  {
-    m_hCandidateLines.SetVisible(false);
-  }
-  else
-  {
-    m_hCandidateLines.SetLines(lines);
-    m_hCandidateLines.SetTransformation(m_ObjectTransform);
-    m_hCandidateLines.SetVisible(true);
-  }
-
-  // hover accents: the edge under the cursor, the outline of the hovered face
-  lines.Clear();
-
-  if (m_Hover.IsValid() && m_ModalOp == ModalOp::None)
-  {
-    if (m_SubMode == plBrushSubMode::Edge && m_Hover.m_iEdgeV0 >= 0)
-    {
-      lines.PushBack(mesh.m_Vertices[m_Hover.m_iEdgeV0]);
-      lines.PushBack(mesh.m_Vertices[m_Hover.m_iEdgeV1]);
-    }
-    else if (m_SubMode == plBrushSubMode::Face)
-    {
-      AppendFaceOutline(lines, static_cast<plUInt32>(m_Hover.m_iFace));
-    }
-  }
-
-  if (lines.IsEmpty())
-  {
-    m_hHoverLines.SetVisible(false);
-  }
-  else
-  {
-    m_hHoverLines.SetLines(lines);
-    m_hHoverLines.SetTransformation(m_ObjectTransform);
-    m_hHoverLines.SetVisible(true);
-  }
+  m_hCandidateLines.SetVisible(false);
+  m_hHoverLines.SetVisible(false);
 
   // selection accents: selected edges as brand lines, selected faces as outline + insets
-  lines.Clear();
+  plDynamicArray<plVec3> lines;
 
   for (plUInt64 uiEdge : m_SelectedEdges)
   {
