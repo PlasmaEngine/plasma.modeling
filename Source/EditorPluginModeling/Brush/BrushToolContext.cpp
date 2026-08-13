@@ -42,6 +42,81 @@ plBrushToolContext::~plBrushToolContext()
   m_TranslateGizmo.m_GizmoEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
   m_RotateGizmo.m_GizmoEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
   m_ScaleGizmo.m_GizmoEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::GizmoEventHandler, this));
+
+  SetDocument(nullptr);
+}
+
+void plBrushToolContext::SetDocument(plGameObjectDocument* pDocument)
+{
+  if (m_pDocument == pDocument)
+    return;
+
+  if (m_pDocument != nullptr)
+  {
+    m_pDocument->GetObjectManager()->m_PropertyEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::PropertyEventHandler, this));
+    m_pDocument->GetObjectManager()->m_StructureEvents.RemoveEventHandler(plMakeDelegate(&plBrushToolContext::StructureEventHandler, this));
+  }
+
+  m_pDocument = pDocument;
+
+  if (m_pDocument != nullptr)
+  {
+    m_pDocument->GetObjectManager()->m_PropertyEvents.AddEventHandler(plMakeDelegate(&plBrushToolContext::PropertyEventHandler, this));
+    m_pDocument->GetObjectManager()->m_StructureEvents.AddEventHandler(plMakeDelegate(&plBrushToolContext::StructureEventHandler, this));
+  }
+}
+
+void plBrushToolContext::PropertyEventHandler(const plDocumentObjectPropertyEvent& e)
+{
+  if (m_SubMode == plBrushSubMode::Object)
+    return;
+
+  // our own preview writes raise these too — during a drag the operation owns the state
+  if (m_bInTemporaryCommands || m_ModalOp != ModalOp::None)
+    return;
+
+  if (e.m_pObject == nullptr || !m_BrushComponent.IsValid())
+    return;
+
+  const plUuid guid = e.m_pObject->GetGuid();
+
+  // the owner object matters as well: moving the brush moves every handle
+  if (guid != m_BrushComponent && guid != m_BrushOwnerObject)
+    return;
+
+  RefreshFromDocument();
+}
+
+void plBrushToolContext::StructureEventHandler(const plDocumentObjectStructureEvent& e)
+{
+  if (m_SubMode == plBrushSubMode::Object || !m_BrushComponent.IsValid())
+    return;
+
+  if (e.m_EventType != plDocumentObjectStructureEvent::Type::AfterObjectRemoved)
+    return;
+
+  if (e.m_pObject == nullptr)
+    return;
+
+  const plUuid guid = e.m_pObject->GetGuid();
+
+  if (guid == m_BrushComponent || guid == m_BrushOwnerObject)
+  {
+    // the target is gone (deleted, or its creation undone) — back to draw mode
+    SetSubMode(plBrushSubMode::Object);
+  }
+}
+
+void plBrushToolContext::RefreshFromDocument()
+{
+  if (!RebuildBaseMesh())
+  {
+    SetSubMode(plBrushSubMode::Object);
+    return;
+  }
+
+  RepositionGizmos();
+  UpdateOverlays();
 }
 
 void plBrushToolContext::OnSetOwner(plQtEngineDocumentWindow* pOwnerWindow, plQtEngineViewWidget* pOwnerView)

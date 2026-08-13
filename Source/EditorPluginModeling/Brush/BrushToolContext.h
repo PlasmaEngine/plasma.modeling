@@ -12,6 +12,8 @@
 
 class plDrawBoxGizmo;
 class plGameObjectDocument;
+struct plDocumentObjectPropertyEvent;
+struct plDocumentObjectStructureEvent;
 
 struct plBrushSubMode
 {
@@ -55,7 +57,7 @@ public:
   ~plBrushToolContext();
 
   void SetDrawGizmo(plDrawBoxGizmo* pGizmo) { m_pDrawGizmo = pGizmo; }
-  void SetDocument(plGameObjectDocument* pDocument) { m_pDocument = pDocument; }
+  void SetDocument(plGameObjectDocument* pDocument);
   plGameObjectDocument* GetDocument() const { return m_pDocument; }
 
   plBrushSubMode::Enum GetSubMode() const { return m_SubMode; }
@@ -116,6 +118,12 @@ private:
   bool AcquireTargetBrush();
   bool RebuildBaseMesh();
   const plDocumentObject* GetBrushObject() const;
+
+  // document changes made behind the context's back (undo/redo, Properties panel edits, moving the
+  // owner object) must refresh the cached mesh, the cubes and the gizmo
+  void PropertyEventHandler(const plDocumentObjectPropertyEvent& e);
+  void StructureEventHandler(const plDocumentObjectStructureEvent& e);
+  void RefreshFromDocument();
 
   // picking & selection
   bool PickAt(const QPoint& viewPos, HoverHit& out_hit);
