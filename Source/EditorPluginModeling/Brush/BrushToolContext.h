@@ -6,6 +6,8 @@
 #include <EditorFramework/Gizmos/TranslateGizmo.h>
 #include <EditorPluginModeling/EditorPluginModelingDLL.h>
 #include <Foundation/Containers/HashSet.h>
+#include <Foundation/Containers/HashTable.h>
+#include <Foundation/Types/UniquePtr.h>
 #include <ModelingPlugin/Modeling/EditableMesh.h>
 
 class plDrawBoxGizmo;
@@ -157,13 +159,18 @@ private:
   // overlays
   void UpdateOverlays();
   void ClearOverlays();
-  void AppendVertexBox(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
-  void AppendVertexBoxFilled(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const;
-  void AppendEdgeBar(plDynamicArray<plVec3>& ref_lines, const plVec3& v0, const plVec3& v1, float fRadius) const;
   void AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
   void AppendFaceInset(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace, float fInset) const;
   void AppendWireframe(plDynamicArray<plVec3>& ref_lines) const;
-  float GetMarkerSize() const;
+
+  // element cube handles — the greybox-manipulator visual: solid constant-size cubes on every
+  // selectable element (vertex / edge midpoint / face center), grey when idle, brand when selected,
+  // engine-highlighted on hover, and pickable so a click on a cube selects its element exactly
+  void UpdateElementHandles();
+  void HideElementHandles();
+  void BuildEdgeList(const plEditableMesh& mesh, plDynamicArray<plUInt32>& out_edgePairs) const;
+  bool MakeHoverFromElement(plUInt32 uiElement, HoverHit& out_hit) const;
+  plInt32 FindFaceUsingVertex(const plEditableMesh& mesh, plUInt32 uiVertex) const;
 
   plDrawBoxGizmo* m_pDrawGizmo = nullptr;
   plGameObjectDocument* m_pDocument = nullptr;
@@ -195,7 +202,11 @@ private:
 
   plEngineGizmoHandle m_hHoverLines;
   plEngineGizmoHandle m_hSelectionLines;
-  plEngineGizmoHandle m_hCandidateLines; ///< what CAN be selected: wireframe + per-mode markers, dim
+  plEngineGizmoHandle m_hCandidateLines; ///< the brush wireframe — structural context, dim
+
+  plDynamicArray<plUniquePtr<plEngineGizmoHandle>> m_ElementHandles; ///< cube pool; index = element index
+  plHashTable<plUuid, plUInt32> m_HandleToElement;                   ///< picked sync-object guid -> element
+  plDynamicArray<plUInt32> m_CurrentEdges;                           ///< edge mode: (v0,v1) pairs, element order
 
   // gizmo state
   ActiveGizmo::Enum m_ActiveGizmo = ActiveGizmo::None;

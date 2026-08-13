@@ -2,6 +2,7 @@
 
 #include <EditorEngineProcessFramework/EngineProcess/EngineProcessMessages.h>
 #include <EditorFramework/Document/GameObjectDocument.h>
+#include <Foundation/Math/ColorScheme.h>
 #include <EditorFramework/DocumentWindow/EngineDocumentWindow.moc.h>
 #include <EditorFramework/DocumentWindow/EngineViewWidget.moc.h>
 #include <EditorFramework/Gizmos/DrawBoxGizmo.h>
@@ -1073,27 +1074,46 @@ plEditorInput plBrushToolContext::DoMousePressEvent(QMouseEvent* e)
 
   if (e->button() == Qt::LeftButton)
   {
-    // a click on an active gizmo handle belongs to the gizmo, not to selection
-    if (m_ActiveGizmo != ActiveGizmo::None)
+    const plObjectPickingResult& res = GetOwnerView()->PickObject(static_cast<plUInt16>(e->pos().x()), static_cast<plUInt16>(e->pos().y()));
+
+    if (res.m_PickedOther.IsValid())
     {
-      const plObjectPickingResult& res = GetOwnerView()->PickObject(static_cast<plUInt16>(e->pos().x()), static_cast<plUInt16>(e->pos().y()));
-
-      if (res.m_PickedOther.IsValid())
+      // a click on an active transform-gizmo handle belongs to the gizmo, not to selection
+      if (auto* pSO = GetOwnerWindow()->GetDocument()->FindSyncObject(res.m_PickedOther))
       {
-        if (auto* pSO = GetOwnerWindow()->GetDocument()->FindSyncObject(res.m_PickedOther))
+        if (pSO->GetDynamicRTTI()->IsDerivedFrom<plGizmoHandle>())
         {
-          if (pSO->GetDynamicRTTI()->IsDerivedFrom<plGizmoHandle>())
-          {
-            plGizmoHandle* pHandle = static_cast<plGizmoHandle*>(pSO);
-            plGizmo* pGizmo = pHandle->GetOwnerGizmo();
+          plGizmoHandle* pHandle = static_cast<plGizmoHandle*>(pSO);
+          plGizmo* pGizmo = pHandle->GetOwnerGizmo();
 
-            if (pGizmo == GetActiveGizmoPtr())
-            {
-              plQtEngineViewWidget* pView = GetOwnerView();
-              pGizmo->ConfigureInteraction(pHandle, &pView->m_pViewConfig->m_Camera, res.m_vPickedPosition, plVec2I32(pView->width(), pView->height()));
-              return pGizmo->MousePressEvent(e);
-            }
+          if (m_ActiveGizmo != ActiveGizmo::None && pGizmo == GetActiveGizmoPtr())
+          {
+            plQtEngineViewWidget* pView = GetOwnerView();
+            pGizmo->ConfigureInteraction(pHandle, &pView->m_pViewConfig->m_Camera, res.m_vPickedPosition, plVec2I32(pView->width(), pView->height()));
+            return pGizmo->MousePressEvent(e);
           }
+        }
+      }
+
+      // a click on an element cube selects its element exactly
+      plUInt32 uiElement = 0;
+
+      if (m_HandleToElement.TryGetValue(res.m_PickedOther, uiElement))
+      {
+        HoverHit hit;
+
+        if (MakeHoverFromElement(uiElement, hit))
+        {
+          ApplyClickSelection(hit, e->modifiers().testFlag(Qt::ShiftModifier));
+          RepositionGizmos();
+          UpdateOverlays();
+
+          if (GetOwnerWindow())
+          {
+            UpdateStatusBarText(GetOwnerWindow());
+          }
+
+          return plEditorInput::WasExclusivelyHandled;
         }
       }
     }
@@ -1149,20 +1169,29 @@ plEditorInput plBrushToolContext::DoMouseMoveEvent(QMouseEvent* e)
   if (e->buttons() != Qt::NoButton)
     return plEditorInput::MayBeHandledByOthers;
 
-  // gizmo handles highlight on hover, exactly as they do for the transform tools
-  if (m_ActiveGizmo != ActiveGizmo::None)
+  // transform-gizmo handles and element cubes both highlight through the engine's highlight system
   {
     const plObjectPickingResult& res = GetOwnerView()->PickObject(static_cast<plUInt16>(e->pos().x()), static_cast<plUInt16>(e->pos().y()));
 
     plUuid hoveredHandle;
+    bool bOverTransformGizmo = false;
+    plUInt32 uiElement = plInvalidIndex;
 
     if (res.m_PickedOther.IsValid())
     {
       if (auto* pSO = GetOwnerWindow()->GetDocument()->FindSyncObject(res.m_PickedOther))
       {
-        if (pSO->GetDynamicRTTI()->IsDerivedFrom<plGizmoHandle>() && static_cast<plGizmoHandle*>(pSO)->GetOwnerGizmo() == GetActiveGizmoPtr())
+        if (pSO->GetDynamicRTTI()->IsDerivedFrom<plGizmoHandle>())
         {
-          hoveredHandle = res.m_PickedOther;
+          if (m_ActiveGizmo != ActiveGizmo::None && static_cast<plGizmoHandle*>(pSO)->GetOwnerGizmo() == GetActiveGizmoPtr())
+          {
+            hoveredHandle = res.m_PickedOther;
+            bOverTransformGizmo = true;
+          }
+          else if (m_HandleToElement.TryGetValue(res.m_PickedOther, uiElement))
+          {
+            hoveredHandle = res.m_PickedOther;
+          }
         }
       }
     }
@@ -1176,12 +1205,30 @@ plEditorInput plBrushToolContext::DoMouseMoveEvent(QMouseEvent* e)
       GetOwnerWindow()->GetEditorEngineConnection()->SendHighlightObjectMessage(&msg);
     }
 
-    if (hoveredHandle.IsValid())
+    if (bOverTransformGizmo)
     {
       // the cursor is on the gizmo — no brush hover underneath it
       if (m_Hover.IsValid())
       {
         m_Hover.Reset();
+        UpdateOverlays();
+      }
+
+      return plEditorInput::WasExclusivelyHandled;
+    }
+
+    if (uiElement != plInvalidIndex)
+    {
+      // hovering a cube hovers its element — precise, no surface pick involved
+      HoverHit previous = m_Hover;
+
+      if (!MakeHoverFromElement(uiElement, m_Hover))
+      {
+        m_Hover.Reset();
+      }
+
+      if (plMemoryUtils::Compare(&previous, &m_Hover, 1) != 0)
+      {
         UpdateOverlays();
       }
 
@@ -1207,68 +1254,190 @@ plEditorInput plBrushToolContext::DoMouseMoveEvent(QMouseEvent* e)
 //////////////////////////////////////////////////////////////////////////
 // overlays
 
-float plBrushToolContext::GetMarkerSize() const
+static plColor GetElementIdleColor()
 {
-  plBoundingBox bbox = plBoundingBox::MakeInvalid();
-
-  for (const plVec3& v : m_BaseMesh.m_Vertices)
-  {
-    bbox.ExpandToInclude(v);
-  }
-
-  if (!bbox.IsValid())
-    return 0.05f;
-
-  return plMath::Clamp(bbox.GetHalfExtents().GetLength() * 0.03f, 0.02f, 0.25f);
+  return plColorScheme::LightUI(plColorScheme::Gray);
 }
 
-void plBrushToolContext::AppendVertexBox(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const
+static plColor GetElementSelectedColor()
 {
-  // a small wire cube reads as the mockup's square vertex handle from every camera angle
-  const plVec3 c[8] = {
-    vPos + plVec3(-fSize, -fSize, -fSize),
-    vPos + plVec3(fSize, -fSize, -fSize),
-    vPos + plVec3(fSize, fSize, -fSize),
-    vPos + plVec3(-fSize, fSize, -fSize),
-    vPos + plVec3(-fSize, -fSize, fSize),
-    vPos + plVec3(fSize, -fSize, fSize),
-    vPos + plVec3(fSize, fSize, fSize),
-    vPos + plVec3(-fSize, fSize, fSize),
-  };
+  return plColorScheme::LightUI(plColorScheme::PlasmaBranding);
+}
 
-  const plUInt32 edges[12][2] = {
-    {0, 1}, {1, 2}, {2, 3}, {3, 0}, // bottom
-    {4, 5}, {5, 6}, {6, 7}, {7, 4}, // top
-    {0, 4}, {1, 5}, {2, 6}, {3, 7}, // sides
-  };
+void plBrushToolContext::BuildEdgeList(const plEditableMesh& mesh, plDynamicArray<plUInt32>& out_edgePairs) const
+{
+  // deterministic order (face traversal), each unique edge once — element index = pair index
+  out_edgePairs.Clear();
 
-  for (const auto& edge : edges)
+  plHashSet<plUInt64> seen;
+
+  for (const plBrushFace& face : mesh.m_Faces)
   {
-    ref_lines.PushBack(c[edge[0]]);
-    ref_lines.PushBack(c[edge[1]]);
+    for (plUInt32 i = 0; i < face.m_Corners.GetCount(); ++i)
+    {
+      const plUInt32 uiV0 = face.m_Corners[i];
+      const plUInt32 uiV1 = face.m_Corners[(i + 1) % face.m_Corners.GetCount()];
+
+      if (!seen.Insert(MakeEdgeKey(uiV0, uiV1)))
+      {
+        out_edgePairs.PushBack(uiV0);
+        out_edgePairs.PushBack(uiV1);
+      }
+    }
   }
 }
 
-void plBrushToolContext::AppendVertexBoxFilled(plDynamicArray<plVec3>& ref_lines, const plVec3& vPos, float fSize) const
+plInt32 plBrushToolContext::FindFaceUsingVertex(const plEditableMesh& mesh, plUInt32 uiVertex) const
 {
-  AppendVertexBox(ref_lines, vPos, fSize);
+  for (plUInt32 uiFace = 0; uiFace < mesh.m_Faces.GetCount(); ++uiFace)
+  {
+    for (plUInt32 uiCorner : mesh.m_Faces[uiFace].m_Corners)
+    {
+      if (uiCorner == uiVertex)
+        return static_cast<plInt32>(uiFace);
+    }
+  }
 
-  // body diagonals + axis cross make the box read as solid ("fills" when selected)
-  ref_lines.PushBack(vPos + plVec3(-fSize, -fSize, -fSize));
-  ref_lines.PushBack(vPos + plVec3(fSize, fSize, fSize));
-  ref_lines.PushBack(vPos + plVec3(fSize, -fSize, -fSize));
-  ref_lines.PushBack(vPos + plVec3(-fSize, fSize, fSize));
-  ref_lines.PushBack(vPos + plVec3(fSize, fSize, -fSize));
-  ref_lines.PushBack(vPos + plVec3(-fSize, -fSize, fSize));
-  ref_lines.PushBack(vPos + plVec3(-fSize, fSize, -fSize));
-  ref_lines.PushBack(vPos + plVec3(fSize, -fSize, fSize));
+  return -1;
+}
 
-  ref_lines.PushBack(vPos - plVec3(fSize, 0, 0));
-  ref_lines.PushBack(vPos + plVec3(fSize, 0, 0));
-  ref_lines.PushBack(vPos - plVec3(0, fSize, 0));
-  ref_lines.PushBack(vPos + plVec3(0, fSize, 0));
-  ref_lines.PushBack(vPos - plVec3(0, 0, fSize));
-  ref_lines.PushBack(vPos + plVec3(0, 0, fSize));
+bool plBrushToolContext::MakeHoverFromElement(plUInt32 uiElement, HoverHit& out_hit) const
+{
+  const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
+
+  out_hit.Reset();
+
+  switch (m_SubMode)
+  {
+    case plBrushSubMode::Vertex:
+      if (uiElement >= mesh.m_Vertices.GetCount())
+        return false;
+      out_hit.m_iVertex = static_cast<plInt32>(uiElement);
+      out_hit.m_iFace = FindFaceUsingVertex(mesh, uiElement);
+      return out_hit.m_iFace >= 0;
+
+    case plBrushSubMode::Edge:
+      if (uiElement * 2 + 1 >= m_CurrentEdges.GetCount())
+        return false;
+      out_hit.m_iEdgeV0 = static_cast<plInt32>(m_CurrentEdges[uiElement * 2]);
+      out_hit.m_iEdgeV1 = static_cast<plInt32>(m_CurrentEdges[uiElement * 2 + 1]);
+      out_hit.m_iFace = FindFaceUsingVertex(mesh, m_CurrentEdges[uiElement * 2]);
+      return out_hit.m_iFace >= 0;
+
+    case plBrushSubMode::Face:
+      if (uiElement >= mesh.m_Faces.GetCount())
+        return false;
+      out_hit.m_iFace = static_cast<plInt32>(uiElement);
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+void plBrushToolContext::UpdateElementHandles()
+{
+  // cubes get expensive to sync on dense meshes — beyond the cap the wireframe carries the mode alone
+  constexpr plUInt32 uiMaxHandles = 256;
+
+  const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
+
+  plUInt32 uiElementCount = 0;
+
+  switch (m_SubMode)
+  {
+    case plBrushSubMode::Vertex:
+      uiElementCount = mesh.m_Vertices.GetCount();
+      break;
+    case plBrushSubMode::Edge:
+      BuildEdgeList(mesh, m_CurrentEdges);
+      uiElementCount = m_CurrentEdges.GetCount() / 2;
+      break;
+    case plBrushSubMode::Face:
+      uiElementCount = mesh.m_Faces.GetCount();
+      break;
+    default:
+      break;
+  }
+
+  if (uiElementCount > uiMaxHandles)
+  {
+    HideElementHandles();
+    return;
+  }
+
+  auto* pDocument = GetOwnerWindow() ? GetOwnerWindow()->GetDocument() : nullptr;
+
+  if (pDocument == nullptr)
+    return;
+
+  // grow the pool; the guid map only changes when a handle is created
+  while (m_ElementHandles.GetCount() < uiElementCount)
+  {
+    plUniquePtr<plEngineGizmoHandle> pHandle = PL_DEFAULT_NEW(plEngineGizmoHandle);
+    pHandle->ConfigureHandle(this, plEngineGizmoHandleType::Box, GetElementIdleColor(),
+      plGizmoFlags::ConstantSize | plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho | plGizmoFlags::Pickable);
+
+    pDocument->AddSyncObject(pHandle.Borrow());
+
+    m_HandleToElement[pHandle->GetGuid()] = m_ElementHandles.GetCount();
+    m_ElementHandles.PushBack(std::move(pHandle));
+  }
+
+  for (plUInt32 uiElement = 0; uiElement < m_ElementHandles.GetCount(); ++uiElement)
+  {
+    plEngineGizmoHandle* pHandle = m_ElementHandles[uiElement].Borrow();
+
+    if (uiElement >= uiElementCount)
+    {
+      pHandle->SetVisible(false);
+      continue;
+    }
+
+    plVec3 vLocalPos = plVec3::MakeZero();
+    bool bSelected = false;
+
+    switch (m_SubMode)
+    {
+      case plBrushSubMode::Vertex:
+        vLocalPos = mesh.m_Vertices[uiElement];
+        bSelected = m_SelectedVertices.Contains(uiElement);
+        break;
+
+      case plBrushSubMode::Edge:
+      {
+        const plUInt32 uiV0 = m_CurrentEdges[uiElement * 2];
+        const plUInt32 uiV1 = m_CurrentEdges[uiElement * 2 + 1];
+        vLocalPos = plMath::Lerp(mesh.m_Vertices[uiV0], mesh.m_Vertices[uiV1], 0.5f);
+        bSelected = m_SelectedEdges.Contains(MakeEdgeKey(uiV0, uiV1));
+        break;
+      }
+
+      case plBrushSubMode::Face:
+        vLocalPos = mesh.ComputeFaceCenter(uiElement);
+        bSelected = m_SelectedFaces.Contains(mesh.m_Faces[uiElement].m_uiFaceId);
+        break;
+
+      default:
+        break;
+    }
+
+    // the manipulator-nob look: solid constant-size cube, sized a touch below theirs
+    plTransform t(m_ObjectTransform.TransformPosition(vLocalPos));
+    t.m_vScale.Set(0.1f);
+
+    pHandle->SetTransformation(t);
+    pHandle->SetColor(bSelected ? GetElementSelectedColor() : GetElementIdleColor());
+    pHandle->SetVisible(true);
+  }
+}
+
+void plBrushToolContext::HideElementHandles()
+{
+  for (auto& pHandle : m_ElementHandles)
+  {
+    pHandle->SetVisible(false);
+  }
 }
 
 void plBrushToolContext::AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const
@@ -1280,39 +1449,6 @@ void plBrushToolContext::AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, pl
   {
     ref_lines.PushBack(mesh.m_Vertices[face.m_Corners[i]]);
     ref_lines.PushBack(mesh.m_Vertices[face.m_Corners[(i + 1) % face.m_Corners.GetCount()]]);
-  }
-}
-
-void plBrushToolContext::AppendEdgeBar(plDynamicArray<plVec3>& ref_lines, const plVec3& v0, const plVec3& v1, float fRadius) const
-{
-  // an edge rendered as a thin elongated wire box — the edge-mode sibling of the vertex box
-  plVec3 vDir = v1 - v0;
-
-  if (vDir.NormalizeIfNotZero(plVec3(1, 0, 0)).Failed())
-    return;
-
-  const plVec3 vHelper = (plMath::Abs(vDir.z) < 0.9f) ? plVec3(0, 0, 1) : plVec3(1, 0, 0);
-
-  plVec3 vN1 = vDir.CrossRH(vHelper);
-  vN1.Normalize();
-  const plVec3 vN2 = vDir.CrossRH(vN1);
-
-  const plVec3 offsets[4] = {vN1 * fRadius, vN2 * fRadius, -vN1 * fRadius, -vN2 * fRadius};
-
-  // four long rails
-  for (const plVec3& vOffset : offsets)
-  {
-    ref_lines.PushBack(v0 + vOffset);
-    ref_lines.PushBack(v1 + vOffset);
-  }
-
-  // diamond caps at both ends
-  for (plUInt32 i = 0; i < 4; ++i)
-  {
-    ref_lines.PushBack(v0 + offsets[i]);
-    ref_lines.PushBack(v0 + offsets[(i + 1) % 4]);
-    ref_lines.PushBack(v1 + offsets[i]);
-    ref_lines.PushBack(v1 + offsets[(i + 1) % 4]);
   }
 }
 
@@ -1369,6 +1505,8 @@ void plBrushToolContext::ClearOverlays()
   m_hCandidateLines.SetVisible(false);
   m_hHoverLines.SetVisible(false);
   m_hSelectionLines.SetVisible(false);
+
+  HideElementHandles();
 }
 
 void plBrushToolContext::UpdateOverlays()
@@ -1380,28 +1518,14 @@ void plBrushToolContext::UpdateOverlays()
   }
 
   const plEditableMesh& mesh = (m_ModalOp != ModalOp::None) ? m_PreviewMesh : m_BaseMesh;
-  const float fMarker = GetMarkerSize();
+
+  // the cubes are the selection UI (grey = selectable, brand = selected, highlight = hovered);
+  // the line layers stay as thin structural accents around them
+  UpdateElementHandles();
 
   plDynamicArray<plVec3> lines;
 
-  // candidates: the wireframe shows the editable structure in every mode; vertex mode marks every
-  // vertex with a box, face mode marks every face with a Blender-style center dot
   AppendWireframe(lines);
-
-  if (m_SubMode == plBrushSubMode::Vertex)
-  {
-    for (const plVec3& v : mesh.m_Vertices)
-    {
-      AppendVertexBox(lines, v, fMarker * 0.35f);
-    }
-  }
-  else if (m_SubMode == plBrushSubMode::Face)
-  {
-    for (plUInt32 uiFace = 0; uiFace < mesh.m_Faces.GetCount(); ++uiFace)
-    {
-      AppendVertexBox(lines, mesh.ComputeFaceCenter(uiFace), fMarker * 0.2f);
-    }
-  }
 
   if (lines.IsEmpty())
   {
@@ -1414,25 +1538,19 @@ void plBrushToolContext::UpdateOverlays()
     m_hCandidateLines.SetVisible(true);
   }
 
-  // hover
+  // hover accents: the edge under the cursor, the outline of the hovered face
   lines.Clear();
 
   if (m_Hover.IsValid() && m_ModalOp == ModalOp::None)
   {
-    if (m_SubMode == plBrushSubMode::Vertex && m_Hover.m_iVertex >= 0)
+    if (m_SubMode == plBrushSubMode::Edge && m_Hover.m_iEdgeV0 >= 0)
     {
-      AppendVertexBox(lines, mesh.m_Vertices[m_Hover.m_iVertex], fMarker * 0.5f);
-    }
-    else if (m_SubMode == plBrushSubMode::Edge && m_Hover.m_iEdgeV0 >= 0)
-    {
-      AppendEdgeBar(lines, mesh.m_Vertices[m_Hover.m_iEdgeV0], mesh.m_Vertices[m_Hover.m_iEdgeV1], fMarker * 0.12f);
+      lines.PushBack(mesh.m_Vertices[m_Hover.m_iEdgeV0]);
+      lines.PushBack(mesh.m_Vertices[m_Hover.m_iEdgeV1]);
     }
     else if (m_SubMode == plBrushSubMode::Face)
     {
-      const plUInt32 uiFace = static_cast<plUInt32>(m_Hover.m_iFace);
-      AppendFaceOutline(lines, uiFace);
-      AppendFaceInset(lines, uiFace, 0.85f);
-      AppendVertexBox(lines, mesh.ComputeFaceCenter(uiFace), fMarker * 0.3f);
+      AppendFaceOutline(lines, static_cast<plUInt32>(m_Hover.m_iFace));
     }
   }
 
@@ -1447,16 +1565,8 @@ void plBrushToolContext::UpdateOverlays()
     m_hHoverLines.SetVisible(true);
   }
 
-  // selection
+  // selection accents: selected edges as brand lines, selected faces as outline + insets
   lines.Clear();
-
-  for (plUInt32 uiVertex : m_SelectedVertices)
-  {
-    if (uiVertex < mesh.m_Vertices.GetCount())
-    {
-      AppendVertexBoxFilled(lines, mesh.m_Vertices[uiVertex], fMarker * 0.45f);
-    }
-  }
 
   for (plUInt64 uiEdge : m_SelectedEdges)
   {
@@ -1465,10 +1575,8 @@ void plBrushToolContext::UpdateOverlays()
 
     if (uiV0 < mesh.m_Vertices.GetCount() && uiV1 < mesh.m_Vertices.GetCount())
     {
-      // solid bar plus filled endpoint boxes — the selected edge owns its vertices visually
-      AppendEdgeBar(lines, mesh.m_Vertices[uiV0], mesh.m_Vertices[uiV1], fMarker * 0.12f);
-      AppendVertexBoxFilled(lines, mesh.m_Vertices[uiV0], fMarker * 0.28f);
-      AppendVertexBoxFilled(lines, mesh.m_Vertices[uiV1], fMarker * 0.28f);
+      lines.PushBack(mesh.m_Vertices[uiV0]);
+      lines.PushBack(mesh.m_Vertices[uiV1]);
     }
   }
 
@@ -1478,12 +1586,9 @@ void plBrushToolContext::UpdateOverlays()
     {
       if (mesh.m_Faces[uiFace].m_uiFaceId == uiFaceId)
       {
-        // stacked insets read as a filled face; the filled center dot matches the vertex language
         AppendFaceOutline(lines, uiFace);
-        AppendFaceInset(lines, uiFace, 0.75f);
-        AppendFaceInset(lines, uiFace, 0.5f);
-        AppendFaceInset(lines, uiFace, 0.25f);
-        AppendVertexBoxFilled(lines, mesh.ComputeFaceCenter(uiFace), fMarker * 0.28f);
+        AppendFaceInset(lines, uiFace, 0.7f);
+        AppendFaceInset(lines, uiFace, 0.4f);
       }
     }
   }
