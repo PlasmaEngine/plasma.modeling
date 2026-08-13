@@ -7,6 +7,8 @@
 #include <Core/WorldSerializer/WorldWriter.h>
 #include <Foundation/IO/MemoryStream.h>
 #include <ModelingPlugin/Modeling/BrushComponent.h>
+#include <ModelingPlugin/Modeling/BrushWorldModule.h>
+#include <ModelingPlugin/Modeling/MeshCSG.h>
 #include <RendererCore/Material/MaterialResource.h>
 #include <RendererCore/Meshes/CpuMeshResource.h>
 #include <RendererCore/Meshes/MeshComponentBase.h>
@@ -18,11 +20,12 @@
 static const char* s_szDefaultBrushMaterial = "{ 1c47ee4c-0379-4280-85f5-b8cda61941d2 }";
 
 // clang-format off
-PL_BEGIN_COMPONENT_TYPE(plBrushComponent, 1, plComponentMode::Static)
+PL_BEGIN_COMPONENT_TYPE(plBrushComponent, 2, plComponentMode::Static)
 {
   PL_BEGIN_PROPERTIES
   {
     PL_ENUM_ACCESSOR_PROPERTY("Shape", plBrushShape, GetShape, SetShape),
+    PL_ACCESSOR_PROPERTY("Subtractive", GetSubtractive, SetSubtractive),
     PL_ARRAY_ACCESSOR_PROPERTY("Materials", Materials_GetCount, Materials_GetValue, Materials_SetValue, Materials_Insert, Materials_Remove)->AddAttributes(new plAssetBrowserAttribute("CompatibleAsset_Material")),
     PL_ACCESSOR_PROPERTY("Color", GetColor, SetColor)->AddAttributes(new plExposeColorAlphaAttribute()),
     PL_ACCESSOR_PROPERTY("CustomData", GetCustomData, SetCustomData)->AddAttributes(new plDefaultValueAttribute(plVec4(0, 1, 0, 1))),
@@ -87,6 +90,9 @@ void plBrushComponent::SerializeComponent(plWorldWriter& inout_stream) const
   s << m_bIncludeInNavmesh;
   s << m_bUseAsOccluder;
 
+  // version 2
+  s << m_bSubtractive;
+
   s << m_Materials.GetCount();
   for (const auto& mat : m_Materials)
   {
@@ -100,6 +106,7 @@ void plBrushComponent::SerializeComponent(plWorldWriter& inout_stream) const
 void plBrushComponent::DeserializeComponent(plWorldReader& inout_stream)
 {
   SUPER::DeserializeComponent(inout_stream);
+  const plUInt32 uiVersion = inout_stream.GetComponentTypeVersion(GetStaticRTTI());
   plStreamReader& s = inout_stream.GetStream();
 
   s >> m_Shape;
@@ -117,6 +124,11 @@ void plBrushComponent::DeserializeComponent(plWorldReader& inout_stream)
   s >> m_bGenerateCollision;
   s >> m_bIncludeInNavmesh;
   s >> m_bUseAsOccluder;
+
+  if (uiVersion >= 2)
+  {
+    s >> m_bSubtractive;
+  }
 
   plUInt32 uiMaterials = 0;
   s >> uiMaterials;
@@ -138,10 +150,17 @@ void plBrushComponent::OnActivated()
   }
 
   SUPER::OnActivated();
+
+  GetWorld()->GetOrCreateModule<plBrushWorldModule>()->RegisterBrush(this);
 }
 
 void plBrushComponent::OnDeactivated()
 {
+  if (plBrushWorldModule* pModule = GetWorld()->GetModule<plBrushWorldModule>())
+  {
+    pModule->DeregisterBrush(this);
+  }
+
   plRenderDataManager* pRenderDataManager = GetWorld()->GetModule<plRenderDataManager>();
   pRenderDataManager->DeleteInstanceData(m_InstanceDataOffset);
 
@@ -169,6 +188,11 @@ plResult plBrushComponent::GetLocalBounds(plBoundingBoxSphere& bounds, bool& bAl
 void plBrushComponent::OnMsgExtractRenderData(plMsgExtractRenderData& msg) const
 {
   if (!m_hMesh.IsValid())
+    return;
+
+  // cutters are an authoring aid: visible while editing, gone the moment the world simulates
+  // (play mode, exported game)
+  if (m_bSubtractive && GetWorld()->GetWorldSimulationEnabled())
     return;
 
   const bool bDynamic = GetOwner()->IsDynamic();
@@ -201,6 +225,17 @@ void plBrushComponent::OnMsgExtractRenderData(plMsgExtractRenderData& msg) const
 void plBrushComponent::SetShape(plEnum<plBrushShape> shape)
 {
   m_Shape = shape;
+  InvalidateMesh();
+}
+
+void plBrushComponent::SetSubtractive(bool b)
+{
+  if (m_bSubtractive == b)
+    return;
+
+  m_bSubtractive = b;
+
+  // the world module's change detection re-carves affected additive brushes next frame
   InvalidateMesh();
 }
 
@@ -430,13 +465,82 @@ void plBrushComponent::BuildEditableMesh(plEditableMesh& out_mesh) const
   }
 }
 
-void plBrushComponent::GenerateMeshName(plStringBuilder& out_sName) const
+void plBrushComponent::BuildEvaluatedMesh(plEditableMesh& out_mesh) const
 {
-  // The mesh identity is a content hash: identical brushes (duplicates) share one GPU mesh, and any
-  // change to shape, parameters, face overrides or the material list produces a new resource.
-  plEditableMesh mesh;
-  BuildEditableMesh(mesh);
+  BuildEditableMesh(out_mesh);
 
+  // a cutter never gets carved itself
+  if (m_bSubtractive || out_mesh.m_Faces.IsEmpty())
+    return;
+
+  const plBrushWorldModule* pModule = GetWorld()->GetModule<plBrushWorldModule>();
+
+  if (pModule == nullptr)
+    return;
+
+  const plBoundingBox localBounds = out_mesh.ComputeBounds();
+
+  if (!localBounds.IsValid())
+    return;
+
+  const plTransform ownTransform = GetOwner()->GetGlobalTransform();
+
+  plBoundingBox worldBounds = localBounds;
+  worldBounds.TransformFromOrigin(ownTransform.GetAsMat4());
+
+  plDynamicArray<const plBrushComponent*> cutters;
+  pModule->QueryCutters(worldBounds, cutters);
+
+  plEditableMesh cutterMesh, result;
+
+  for (const plBrushComponent* pCutter : cutters)
+  {
+    if (pCutter == this)
+      continue;
+
+    pCutter->BuildEditableMesh(cutterMesh);
+
+    if (cutterMesh.m_Faces.IsEmpty())
+      continue;
+
+    const plTransform cutterToSelf = plTransform::MakeLocalTransform(ownTransform, pCutter->GetOwner()->GetGlobalTransform());
+
+    // a non-convex cutter shell refuses cleanly — the target stays uncut by that cutter
+    if (plMeshCSG::SubtractCutter(out_mesh, cutterMesh, cutterToSelf, 0, result).Succeeded())
+    {
+      out_mesh = result;
+    }
+
+    if (out_mesh.m_Faces.IsEmpty())
+      return;
+  }
+}
+
+plUInt64 plBrushComponent::ComputeContentHash() const
+{
+  // geometry inputs only — materials and colors do not change what a cutter carves
+  plUInt64 uiHash = plHashingUtils::xxHash64(&m_Shape, sizeof(m_Shape));
+  uiHash = plHashingUtils::xxHash64(&m_Params, sizeof(m_Params), uiHash);
+  uiHash = plHashingUtils::xxHash64(&m_bSubtractive, sizeof(m_bSubtractive), uiHash);
+
+  if (!m_FaceData.IsEmpty())
+  {
+    uiHash = plHashingUtils::xxHash64(m_FaceData.GetData(), m_FaceData.GetCount(), uiHash);
+  }
+
+  if (!m_StoredMesh.IsEmpty())
+  {
+    uiHash = plHashingUtils::xxHash64(m_StoredMesh.GetData(), m_StoredMesh.GetCount(), uiHash);
+  }
+
+  return uiHash;
+}
+
+void plBrushComponent::GenerateMeshName(const plEditableMesh& mesh, plStringBuilder& out_sName) const
+{
+  // The mesh identity is a content hash of the EVALUATED mesh: identical brushes (duplicates) share
+  // one GPU mesh, and any change to shape, parameters, overlapping cutters, face overrides or the
+  // material list produces a new resource.
   plDefaultMemoryStreamStorage storage;
   plMemoryStreamWriter writer(&storage);
   mesh.Serialize(writer);
@@ -509,15 +613,15 @@ void plBrushComponent::GenerateMeshResourceDescriptor(plMeshResourceDescriptor& 
 template <typename ResourceType>
 plTypedResourceHandle<ResourceType> plBrushComponent::GenerateMesh() const
 {
+  plEditableMesh mesh;
+  BuildEvaluatedMesh(mesh);
+
   plStringBuilder sResourceName;
-  GenerateMeshName(sResourceName);
+  GenerateMeshName(mesh, sResourceName);
 
   plTypedResourceHandle<ResourceType> hResource = plResourceManager::GetExistingResource<ResourceType>(sResourceName);
   if (hResource.IsValid())
     return hResource;
-
-  plEditableMesh mesh;
-  BuildEditableMesh(mesh);
 
   plMeshResourceDescriptor desc;
   GenerateMeshResourceDescriptor(desc, mesh);
@@ -527,11 +631,12 @@ plTypedResourceHandle<ResourceType> plBrushComponent::GenerateMesh() const
 
 void plBrushComponent::OnBuildStaticMesh(plMsgBuildStaticMesh& msg) const
 {
-  if (!m_bGenerateCollision)
+  // a cutter is negative space — its collision is the holes it leaves in others
+  if (!m_bGenerateCollision || m_bSubtractive)
     return;
 
   plEditableMesh mesh;
-  BuildEditableMesh(mesh);
+  BuildEvaluatedMesh(mesh);
 
   plGeometry geom;
   plDynamicArray<plBrushSubMeshRange> ranges;
@@ -593,6 +698,9 @@ void plBrushComponent::OnBuildStaticMesh(plMsgBuildStaticMesh& msg) const
 
 void plBrushComponent::OnMsgExtractGeometry(plMsgExtractGeometry& msg) const
 {
+  if (m_bSubtractive)
+    return;
+
   if (msg.m_Mode == plWorldGeoExtractionUtil::ExtractionMode::CollisionMesh && (m_bGenerateCollision == false || GetOwner()->IsDynamic()))
     return;
 
@@ -604,22 +712,22 @@ void plBrushComponent::OnMsgExtractGeometry(plMsgExtractGeometry& msg) const
 
 void plBrushComponent::OnMsgExtractOccluderData(plMsgExtractOccluderData& msg) const
 {
-  if (!IsActiveAndInitialized() || !m_bUseAsOccluder)
+  if (!IsActiveAndInitialized() || !m_bUseAsOccluder || m_bSubtractive)
     return;
 
   if (m_pOccluderObject == nullptr)
   {
+    plEditableMesh mesh;
+    BuildEvaluatedMesh(mesh);
+
     plStringBuilder sResourceName;
-    GenerateMeshName(sResourceName);
+    GenerateMeshName(mesh, sResourceName);
     sResourceName.Append("_Occluder");
 
     m_pOccluderObject = plRasterizerObject::GetObject(sResourceName);
 
     if (m_pOccluderObject == nullptr)
     {
-      plEditableMesh mesh;
-      BuildEditableMesh(mesh);
-
       plGeometry geom;
       plDynamicArray<plBrushSubMeshRange> ranges;
       mesh.BuildRenderGeometry(geom, ranges, m_Color);

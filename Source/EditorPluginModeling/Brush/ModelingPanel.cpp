@@ -2,8 +2,11 @@
 
 #include <EditorFramework/Document/GameObjectDocument.h>
 #include <EditorPluginModeling/Brush/BrushEditTool.h>
+#include <EditorPluginModeling/Brush/BrushPicking.h>
 #include <EditorPluginModeling/Brush/ModelingPanel.moc.h>
 #include <ModelingPlugin/Modeling/BrushGenerators.h>
+#include <ModelingPlugin/Modeling/MeshCSG.h>
+#include <ToolsFoundation/Command/TreeCommands.h>
 
 #include <QButtonGroup>
 #include <QGridLayout>
@@ -99,6 +102,36 @@ plQtModelingPanel::plQtModelingPanel(plQtDocumentWindow* pWindow, plDocument* pD
   pHint->setWordWrap(true);
   pHint->setStyleSheet("color: #8a8a8a; font-size: 10px;");
   pLayout->addWidget(pHint);
+
+  // ---- CSG ------------------------------------------------------------------
+  QLabel* pCsgHeader = new QLabel("CSG", pContent);
+  pLayout->addWidget(pCsgHeader);
+
+  QGridLayout* pCsgGrid = new QGridLayout();
+  pCsgGrid->setSpacing(3);
+
+  QPushButton* pToggleCutter = new QPushButton("Toggle Cutter", pContent);
+  pToggleCutter->setToolTip("Make the selected brushes subtractive (or solid again). A cutter carves every brush it overlaps, live.");
+  pCsgGrid->addWidget(pToggleCutter, 0, 0);
+
+  QPushButton* pCarve = new QPushButton("Carve", pContent);
+  pCarve->setToolTip("Bake the selected cutter into the brushes it overlaps, then delete the cutter.");
+  pCsgGrid->addWidget(pCarve, 0, 1);
+
+  QPushButton* pHollow = new QPushButton("Hollow", pContent);
+  pHollow->setToolTip("Turn the selected brushes into rooms with walls of their Thickness property.");
+  pCsgGrid->addWidget(pHollow, 1, 0);
+
+  pLayout->addLayout(pCsgGrid);
+
+  QLabel* pCsgHint = new QLabel("Cutters must be convex. Targets can be\nany shape.", pContent);
+  pCsgHint->setWordWrap(true);
+  pCsgHint->setStyleSheet("color: #8a8a8a; font-size: 10px;");
+  pLayout->addWidget(pCsgHint);
+
+  connect(pToggleCutter, &QPushButton::clicked, this, &plQtModelingPanel::OnToggleCutterClicked);
+  connect(pCarve, &QPushButton::clicked, this, &plQtModelingPanel::OnCarveClicked);
+  connect(pHollow, &QPushButton::clicked, this, &plQtModelingPanel::OnHollowClicked);
 
   pLayout->addStretch();
 
@@ -209,6 +242,227 @@ void plQtModelingPanel::SetCheckedMode(int iMode)
   }
 
   m_pModeButtons->setExclusive(true);
+}
+
+//////////////////////////////////////////////////////////////////////////
+// CSG
+
+void plQtModelingPanel::GatherSelectedBrushComponents(plDynamicArray<const plDocumentObject*>& out_components) const
+{
+  out_components.Clear();
+
+  const plGameObjectDocument* pGameDoc = plDynamicCast<const plGameObjectDocument*>(m_pDocument);
+
+  if (pGameDoc == nullptr)
+    return;
+
+  for (const plDocumentObject* pObject : pGameDoc->GetSelectionManager()->GetSelection())
+  {
+    for (const plDocumentObject* pChild : pObject->GetChildren())
+    {
+      if (pChild->GetTypeAccessor().GetType()->GetTypeName() == "plBrushComponent")
+      {
+        out_components.PushBack(pChild);
+      }
+    }
+  }
+}
+
+void plQtModelingPanel::OnToggleCutterClicked()
+{
+  plDynamicArray<const plDocumentObject*> components;
+  GatherSelectedBrushComponents(components);
+
+  if (components.IsEmpty())
+    return;
+
+  auto* pHistory = m_pDocument->GetCommandHistory();
+  pHistory->StartTransaction("Toggle Cutter");
+
+  for (const plDocumentObject* pComponent : components)
+  {
+    plSetObjectPropertyCommand cmd;
+    cmd.m_Object = pComponent->GetGuid();
+    cmd.m_sProperty = "Subtractive";
+    cmd.m_NewValue = !pComponent->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>();
+    pHistory->AddCommand(cmd).AssertSuccess();
+  }
+
+  pHistory->FinishTransaction();
+}
+
+void plQtModelingPanel::OnHollowClicked()
+{
+  plDynamicArray<const plDocumentObject*> components;
+  GatherSelectedBrushComponents(components);
+
+  if (components.IsEmpty())
+    return;
+
+  auto* pHistory = m_pDocument->GetCommandHistory();
+  bool bAny = false;
+
+  plEditableMesh mesh, hollowed;
+
+  for (const plDocumentObject* pComponent : components)
+  {
+    if (plBrushPicking::BuildMeshFromObject(pComponent, mesh).Failed())
+      continue;
+
+    const float fThickness = pComponent->GetTypeAccessor().GetValue("Thickness").ConvertTo<float>();
+
+    if (plMeshCSG::MakeHollow(mesh, fThickness, 0, hollowed).Failed())
+    {
+      plLog::Warning("Hollow: the brush is not convex or too small for a {0} thick wall.", fThickness);
+      continue;
+    }
+
+    if (!bAny)
+    {
+      pHistory->StartTransaction("Hollow Brush");
+      bAny = true;
+    }
+
+    plDataBuffer blob;
+    hollowed.ToDataBuffer(blob);
+
+    {
+      plSetObjectPropertyCommand cmd;
+      cmd.m_Object = pComponent->GetGuid();
+      cmd.m_sProperty = "Shape";
+      cmd.m_NewValue = static_cast<plInt64>(plBrushShape::Editable);
+      pHistory->AddCommand(cmd).AssertSuccess();
+    }
+    {
+      plSetObjectPropertyCommand cmd;
+      cmd.m_Object = pComponent->GetGuid();
+      cmd.m_sProperty = "StoredMesh";
+      cmd.m_NewValue = blob;
+      pHistory->AddCommand(cmd).AssertSuccess();
+    }
+  }
+
+  if (bAny)
+  {
+    pHistory->FinishTransaction();
+  }
+}
+
+void plQtModelingPanel::OnCarveClicked()
+{
+  plDynamicArray<const plDocumentObject*> components;
+  GatherSelectedBrushComponents(components);
+
+  // the selected cutters get baked into everything they overlap, then removed
+  plHybridArray<const plDocumentObject*, 4> cutters;
+
+  for (const plDocumentObject* pComponent : components)
+  {
+    if (pComponent->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>())
+    {
+      cutters.PushBack(pComponent);
+    }
+  }
+
+  if (cutters.IsEmpty())
+  {
+    plLog::Warning("Carve: select a subtractive brush (Toggle Cutter) first.");
+    return;
+  }
+
+  auto* pHistory = m_pDocument->GetCommandHistory();
+  pHistory->StartTransaction("Carve");
+
+  plEditableMesh cutterMesh, targetMesh, result;
+
+  for (const plDocumentObject* pCutter : cutters)
+  {
+    if (plBrushPicking::BuildMeshFromObject(pCutter, cutterMesh).Failed() || cutterMesh.m_Faces.IsEmpty())
+      continue;
+
+    const plTransform cutterTransform = plBrushPicking::GetComponentGlobalTransform(pCutter);
+
+    plBoundingBox cutterWorldBounds = cutterMesh.ComputeBounds();
+    cutterWorldBounds.TransformFromOrigin(cutterTransform.GetAsMat4());
+
+    // every additive brush in the document is a potential target
+    plDynamicArray<const plDocumentObject*> targets;
+    {
+      plDynamicArray<const plDocumentObject*> stack;
+      stack.PushBack(pCutter->GetDocumentObjectManager()->GetRootObject());
+
+      while (!stack.IsEmpty())
+      {
+        const plDocumentObject* pCurrent = stack.PeekBack();
+        stack.PopBack();
+
+        for (const plDocumentObject* pChild : pCurrent->GetChildren())
+        {
+          if (pChild != pCutter && pChild->GetTypeAccessor().GetType()->GetTypeName() == "plBrushComponent" &&
+              !pChild->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>())
+          {
+            targets.PushBack(pChild);
+          }
+
+          stack.PushBack(pChild);
+        }
+      }
+    }
+
+    for (const plDocumentObject* pTarget : targets)
+    {
+      if (plBrushPicking::BuildMeshFromObject(pTarget, targetMesh).Failed() || targetMesh.m_Faces.IsEmpty())
+        continue;
+
+      const plTransform targetTransform = plBrushPicking::GetComponentGlobalTransform(pTarget);
+
+      plBoundingBox targetWorldBounds = targetMesh.ComputeBounds();
+      targetWorldBounds.TransformFromOrigin(targetTransform.GetAsMat4());
+
+      if (!targetWorldBounds.Overlaps(cutterWorldBounds))
+        continue;
+
+      const plTransform cutterToTarget = plTransform::MakeLocalTransform(targetTransform, cutterTransform);
+
+      if (plMeshCSG::SubtractCutter(targetMesh, cutterMesh, cutterToTarget, 0, result).Failed())
+      {
+        plLog::Warning("Carve: the cutter is not convex - decompose it into convex shells first.");
+        continue;
+      }
+
+      // only brushes the cutter actually intersects get converted
+      plDataBuffer before, after;
+      targetMesh.ToDataBuffer(before);
+      result.ToDataBuffer(after);
+
+      if (before == after)
+        continue;
+
+      {
+        plSetObjectPropertyCommand cmd;
+        cmd.m_Object = pTarget->GetGuid();
+        cmd.m_sProperty = "Shape";
+        cmd.m_NewValue = static_cast<plInt64>(plBrushShape::Editable);
+        pHistory->AddCommand(cmd).AssertSuccess();
+      }
+      {
+        plSetObjectPropertyCommand cmd;
+        cmd.m_Object = pTarget->GetGuid();
+        cmd.m_sProperty = "StoredMesh";
+        cmd.m_NewValue = after;
+        pHistory->AddCommand(cmd).AssertSuccess();
+      }
+    }
+
+    // the cutter's job is done — remove its whole object
+    {
+      plRemoveObjectCommand cmd;
+      cmd.m_Object = pCutter->GetParent()->GetGuid();
+      pHistory->AddCommand(cmd).AssertSuccess();
+    }
+  }
+
+  pHistory->FinishTransaction();
 }
 
 void plQtModelingPanel::UncheckAllButtons()

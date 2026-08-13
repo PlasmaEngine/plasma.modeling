@@ -1,6 +1,7 @@
 #include <ModelingPlugin/ModelingPluginPCH.h>
 
 #include <Core/Graphics/Geometry.h>
+#include <Foundation/Containers/HashTable.h>
 #include <Foundation/IO/MemoryStream.h>
 #include <ModelingPlugin/Modeling/EditableMesh.h>
 
@@ -95,6 +96,82 @@ plVec3 plEditableMesh::ComputeFaceCenter(plUInt32 uiFaceIndex) const
   }
 
   return vCenter / static_cast<float>(face.m_Corners.GetCount());
+}
+
+void plEditableMesh::AppendMesh(const plEditableMesh& other)
+{
+  const plUInt32 uiVertexOffset = m_Vertices.GetCount();
+  const plUInt32 uiFaceOffset = m_Faces.GetCount();
+
+  m_Vertices.PushBackRange(other.m_Vertices.GetArrayPtr());
+
+  for (const plBrushFace& srcFace : other.m_Faces)
+  {
+    plBrushFace& face = m_Faces.ExpandAndGetRef();
+    face = srcFace;
+
+    for (plUInt32 i = 0; i < face.m_Corners.GetCount(); ++i)
+    {
+      face.m_Corners[i] += uiVertexOffset;
+    }
+  }
+
+  for (const plBrushShell& srcShell : other.m_Shells)
+  {
+    plBrushShell& shell = m_Shells.ExpandAndGetRef();
+    shell = srcShell;
+    shell.m_uiFirstFace += uiFaceOffset;
+  }
+
+  m_uiNextFaceId = plMath::Max(m_uiNextFaceId, other.m_uiNextFaceId);
+}
+
+void plEditableMesh::ExtractShell(plUInt32 uiShellIndex, plEditableMesh& out_mesh) const
+{
+  out_mesh.Clear();
+
+  const plBrushShell& shell = m_Shells[uiShellIndex];
+
+  plHashTable<plUInt32, plUInt32> remap;
+
+  out_mesh.BeginShell(shell.m_bConvex, shell.m_bSubtractive);
+
+  for (plUInt32 uiFace = shell.m_uiFirstFace; uiFace < shell.m_uiFirstFace + shell.m_uiNumFaces; ++uiFace)
+  {
+    const plBrushFace& srcFace = m_Faces[uiFace];
+
+    plSmallArray<plUInt32, 8> corners;
+
+    for (plUInt32 uiCorner : srcFace.m_Corners)
+    {
+      plUInt32 uiNew = 0;
+
+      if (!remap.TryGetValue(uiCorner, uiNew))
+      {
+        uiNew = out_mesh.AddVertex(m_Vertices[uiCorner]);
+        remap[uiCorner] = uiNew;
+      }
+
+      corners.PushBack(uiNew);
+    }
+
+    const plUInt32 uiNewFace = out_mesh.AddFace(plArrayPtr<const plUInt32>(corners.GetData(), corners.GetCount()), srcFace.m_uiFaceId, srcFace.m_uiMaterialSlot);
+    out_mesh.m_Faces[uiNewFace].m_UV = srcFace.m_UV;
+  }
+
+  out_mesh.m_uiNextFaceId = m_uiNextFaceId;
+}
+
+plBoundingBox plEditableMesh::ComputeBounds() const
+{
+  plBoundingBox bbox = plBoundingBox::MakeInvalid();
+
+  for (const plVec3& v : m_Vertices)
+  {
+    bbox.ExpandToInclude(v);
+  }
+
+  return bbox;
 }
 
 plUInt32 plEditableMesh::GetUsedMaterialSlotCount() const

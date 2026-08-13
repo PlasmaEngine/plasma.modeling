@@ -91,6 +91,11 @@ public:
   void SetThickness(float f);                                // [ property ]
   float GetThickness() const { return m_Params.m_fThickness; } // [ property ]
 
+  /// \brief A subtractive brush is a live cutter: it carves every additive brush it overlaps, emits no
+  /// collision, and only renders while the world is not simulating (edit mode).
+  void SetSubtractive(bool b);                             // [ property ]
+  bool GetSubtractive() const { return m_bSubtractive; }   // [ property ]
+
   void SetGenerateCollision(bool b);                                 // [ property ]
   bool GetGenerateCollision() const { return m_bGenerateCollision; } // [ property ]
 
@@ -110,6 +115,17 @@ public:
 
   /// \brief Builds the current editable mesh: generator output with the FaceData overrides applied.
   void BuildEditableMesh(plEditableMesh& out_mesh) const;
+
+  /// \brief The mesh after non-destructive CSG: the base mesh minus every overlapping subtractive
+  /// brush (world-module query). For subtractive brushes this is just the base mesh.
+  void BuildEvaluatedMesh(plEditableMesh& out_mesh) const;
+
+  /// \brief Hash over everything that shapes the geometry (not materials/colors) — the world module's
+  /// change detection key.
+  plUInt64 ComputeContentHash() const;
+
+  /// \brief Public mesh invalidation, used by the world module when an overlapping cutter changes.
+  void InvalidateBrushMesh() { InvalidateMesh(); }
 
   /// \brief Decodes a FaceData blob into a (faceId -> materialSlot) map. Tolerates empty and unknown versions.
   static void ParseFaceData(const plDataBuffer& data, plHashTable<plUInt32, plUInt8>& out_overrides);
@@ -132,7 +148,7 @@ protected:
   void Materials_Remove(plUInt32 uiIndex);                    // [ property ]
 
   void InvalidateMesh();
-  void GenerateMeshName(plStringBuilder& out_sName) const;
+  void GenerateMeshName(const plEditableMesh& mesh, plStringBuilder& out_sName) const;
   void GenerateMeshResourceDescriptor(plMeshResourceDescriptor& desc, const plEditableMesh& mesh) const;
   plMaterialResourceHandle ResolveMaterial(plUInt32 uiSlot) const;
   const char* GetMaterialIdOrDefault(plUInt32 uiSlot, plStringBuilder& ref_sTemp) const;
@@ -144,6 +160,7 @@ protected:
   plBrushGeneratorParams m_Params;
   plColor m_Color = plColor::White;
   plVec4 m_vCustomData = plVec4(0, 1, 0, 1);
+  bool m_bSubtractive = false;
   bool m_bGenerateCollision = true;
   bool m_bIncludeInNavmesh = true;
   bool m_bUseAsOccluder = true;

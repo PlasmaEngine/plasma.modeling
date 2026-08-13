@@ -98,8 +98,9 @@ void plBrushFaceMaterialDragDropHandler::ApplyToBrushFace(const plDragDropInfo* 
   if (pInfo->m_vDropPosition.IsNaN())
     return;
 
+  // the EVALUATED mesh, so doorway jambs (cap faces from live cutters) are assignable too
   plEditableMesh mesh;
-  if (plBrushPicking::BuildMeshFromObject(pComponent, mesh).Failed())
+  if (plBrushPicking::BuildEvaluatedMeshFromObject(pComponent, mesh).Failed())
     return;
 
   // the drop position is world space; the mesh lives in the owner object's local space

@@ -5,6 +5,7 @@
 #include <GuiFoundation/DocumentWindow/DocumentWindow.moc.h>
 
 class plDocument;
+class plDocumentObject;
 class plQtDocumentWindow;
 class QButtonGroup;
 
@@ -29,12 +30,16 @@ public:
 private Q_SLOTS:
   void OnShapeButtonClicked(int iShape);
   void OnModeButtonClicked(int iMode);
+  void OnToggleCutterClicked();
+  void OnCarveClicked();
+  void OnHollowClicked();
 
 private:
   void GameObjectEventHandler(const plGameObjectEvent& e);
   void BrushModeEventHandler(const plBrushModeEvent& e);
   void UncheckAllButtons();
   void SetCheckedMode(int iMode); ///< -1 = none (tool inactive)
+  void GatherSelectedBrushComponents(plDynamicArray<const plDocumentObject*>& out_components) const;
 
   plDocument* m_pDocument = nullptr;
   QButtonGroup* m_pShapeButtons = nullptr;

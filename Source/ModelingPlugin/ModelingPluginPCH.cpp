@@ -10,4 +10,6 @@ PL_STATICLINK_LIBRARY(ModelingPlugin)
   PL_STATICLINK_REFERENCE(ModelingPlugin_Modeling_Implementation_EditableMesh);
   PL_STATICLINK_REFERENCE(ModelingPlugin_Modeling_Implementation_BrushGenerators);
   PL_STATICLINK_REFERENCE(ModelingPlugin_Modeling_Implementation_BrushComponent);
+  PL_STATICLINK_REFERENCE(ModelingPlugin_Modeling_Implementation_MeshCSG);
+  PL_STATICLINK_REFERENCE(ModelingPlugin_Modeling_Implementation_BrushWorldModule);
 }

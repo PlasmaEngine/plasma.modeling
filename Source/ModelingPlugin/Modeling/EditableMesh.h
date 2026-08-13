@@ -5,6 +5,7 @@
 #include <Foundation/Containers/DynamicArray.h>
 #include <Foundation/Containers/SmallArray.h>
 #include <Foundation/Math/Angle.h>
+#include <Foundation/Math/BoundingBox.h>
 #include <Foundation/Math/Vec2.h>
 #include <Foundation/Math/Vec3.h>
 #include <Foundation/Types/VariantType.h>
@@ -86,6 +87,15 @@ public:
 
   /// \brief Highest material slot referenced by any face, +1. At least 1.
   plUInt32 GetUsedMaterialSlotCount() const;
+
+  /// \brief Appends all shells, faces and vertices of another mesh (indices remapped).
+  void AppendMesh(const plEditableMesh& other);
+
+  /// \brief Copies one shell into a standalone mesh (only the vertices it references).
+  void ExtractShell(plUInt32 uiShellIndex, plEditableMesh& out_mesh) const;
+
+  /// \brief Axis-aligned bounds of all vertices. Invalid for an empty mesh.
+  plBoundingBox ComputeBounds() const;
 
   /// \brief Flat-shaded triangle-soup render geometry, faces sorted by material slot.
   ///

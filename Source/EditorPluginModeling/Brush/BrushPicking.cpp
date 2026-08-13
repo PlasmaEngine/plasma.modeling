@@ -1,8 +1,11 @@
 #include <EditorPluginModeling/EditorPluginModelingPCH.h>
 
+#include <EditorFramework/Document/GameObjectDocument.h>
 #include <EditorPluginModeling/Brush/BrushPicking.h>
 #include <ModelingPlugin/Modeling/BrushGenerators.h>
+#include <ModelingPlugin/Modeling/MeshCSG.h>
 #include <ToolsFoundation/Object/DocumentObjectBase.h>
+#include <ToolsFoundation/Object/DocumentObjectManager.h>
 
 plResult plBrushPicking::BuildMeshFromObject(const plDocumentObject* pComponent, plEditableMesh& out_mesh)
 {
@@ -35,6 +38,107 @@ plResult plBrushPicking::BuildMeshFromObject(const plDocumentObject* pComponent,
   params.m_fThickness = acc.GetValue("Thickness").ConvertTo<float>();
 
   plBrushGenerators::Generate(shape, params, out_mesh);
+  return PL_SUCCESS;
+}
+
+plTransform plBrushPicking::GetComponentGlobalTransform(const plDocumentObject* pComponent)
+{
+  const plGameObjectDocument* pGameDoc = plDynamicCast<const plGameObjectDocument*>(pComponent->GetDocumentObjectManager()->GetDocument());
+
+  if (pGameDoc == nullptr || pComponent->GetParent() == nullptr)
+    return plTransform::MakeIdentity();
+
+  return pGameDoc->GetGlobalTransform(pComponent->GetParent());
+}
+
+namespace
+{
+  void CollectCuttersRecursive(const plDocumentObject* pObject, const plDocumentObject* pExclude, plDynamicArray<const plDocumentObject*>& out_cutters)
+  {
+    for (const plDocumentObject* pChild : pObject->GetChildren())
+    {
+      if (pChild != pExclude && pChild->GetTypeAccessor().GetType()->GetTypeName() == "plBrushComponent")
+      {
+        if (pChild->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>())
+        {
+          out_cutters.PushBack(pChild);
+        }
+      }
+
+      CollectCuttersRecursive(pChild, pExclude, out_cutters);
+    }
+  }
+} // namespace
+
+void plBrushPicking::FindCutterComponents(const plDocumentObject* pAnyDocumentObject, const plDocumentObject* pExclude, plDynamicArray<const plDocumentObject*>& out_cutters)
+{
+  out_cutters.Clear();
+
+  const plDocumentObject* pRoot = pAnyDocumentObject->GetDocumentObjectManager()->GetRootObject();
+
+  CollectCuttersRecursive(pRoot, pExclude, out_cutters);
+
+  // same deterministic order as plBrushWorldModule::QueryCutters — cap face ids must match
+  out_cutters.Sort([](const plDocumentObject* pA, const plDocumentObject* pB)
+    {
+      const plVec3 a = plBrushPicking::GetComponentGlobalTransform(pA).m_vPosition;
+      const plVec3 b = plBrushPicking::GetComponentGlobalTransform(pB).m_vPosition;
+
+      if (a.x != b.x)
+        return a.x < b.x;
+      if (a.y != b.y)
+        return a.y < b.y;
+      return a.z < b.z;
+    });
+}
+
+plResult plBrushPicking::BuildEvaluatedMeshFromObject(const plDocumentObject* pComponent, plEditableMesh& out_mesh)
+{
+  if (BuildMeshFromObject(pComponent, out_mesh).Failed())
+    return PL_FAILURE;
+
+  const bool bSubtractive = pComponent->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>();
+
+  if (bSubtractive || out_mesh.m_Faces.IsEmpty())
+    return PL_SUCCESS;
+
+  plDynamicArray<const plDocumentObject*> cutters;
+  FindCutterComponents(pComponent, pComponent, cutters);
+
+  if (cutters.IsEmpty())
+    return PL_SUCCESS;
+
+  const plTransform targetTransform = GetComponentGlobalTransform(pComponent);
+
+  plBoundingBox targetWorldBounds = out_mesh.ComputeBounds();
+  targetWorldBounds.TransformFromOrigin(targetTransform.GetAsMat4());
+
+  plEditableMesh cutterMesh, result;
+
+  for (const plDocumentObject* pCutter : cutters)
+  {
+    if (BuildMeshFromObject(pCutter, cutterMesh).Failed() || cutterMesh.m_Faces.IsEmpty())
+      continue;
+
+    const plTransform cutterTransform = GetComponentGlobalTransform(pCutter);
+
+    plBoundingBox cutterWorldBounds = cutterMesh.ComputeBounds();
+    cutterWorldBounds.TransformFromOrigin(cutterTransform.GetAsMat4());
+
+    if (!cutterWorldBounds.Overlaps(targetWorldBounds))
+      continue;
+
+    const plTransform cutterToTarget = plTransform::MakeLocalTransform(targetTransform, cutterTransform);
+
+    if (plMeshCSG::SubtractCutter(out_mesh, cutterMesh, cutterToTarget, 0, result).Succeeded())
+    {
+      out_mesh = result;
+    }
+
+    if (out_mesh.m_Faces.IsEmpty())
+      break;
+  }
+
   return PL_SUCCESS;
 }
 
