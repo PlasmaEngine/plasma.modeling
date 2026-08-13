@@ -391,7 +391,14 @@ void plBrushToolContext::SetSubMode(plBrushSubMode::Enum mode)
 
   m_SubMode = mode;
 
-  // each mode has its own selection set, so a visible gizmo must follow (or vanish)
+  // a mode owns its selection: leftovers from another mode would silently join every G/gizmo
+  // operation (the op works on the union of all sets)
+  m_SelectedVertices.Clear();
+  m_SelectedEdges.Clear();
+  m_SelectedFaces.Clear();
+  m_Hover.Reset();
+
+  // with the selection gone an active gizmo has nothing to anchor to
   RepositionGizmos();
 
   UpdateOverlays();
