@@ -5,8 +5,8 @@ PluginInfo
 {
 	string %DisplayName{"Modeling"}
 	string %Category{"Tools"}
-	string %MinEngineVersion{"0.11.2"}
-	string %MaxEngineVersion{"0.11.2"}
+	string %MinEngineVersion{"0.12.0"}
+	string %MaxEngineVersion{"0.12.0"}
 	string %Icon{"ModelingIcon.png"}
 	string %Banner{"ModelingBanner.png"}
 	string %Description{"In-editor level modeling: draw brushes with the Brush tool (B), edit their vertices, edges and faces, carve openings with live cutters and texture every face. Brushes render, collide, occlude and bake into the navmesh, and are merged into optimised meshes at scene export."}

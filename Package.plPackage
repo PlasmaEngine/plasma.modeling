@@ -13,15 +13,15 @@ PackageInfo
 	// 0.x until the release gates of the road-to-1.0 plan (performance budgets,
 	// manual pages, release notes) pass; then 1.0.0.
 	string %Id{"plasma.modeling"}
-	string %Version{"0.2.2"}
+	string %Version{"0.3.0"}
 	string %Publisher{"PlasmaTechnology"}
 	string %License{"MIT"}
 	string %Homepage{"https://plasmagameengine.com"}
 
 	// ---- compatibility --------------------------------------------------------
-	string %MinEngineVersion{"0.11.2"}
-	string %MaxEngineVersion{"0.11.2"}
-	string %AbiTag{"win64-msvc19-0.11.2-abi6-dev"}
+	string %MinEngineVersion{"0.12.0"}
+	string %MaxEngineVersion{"0.12.0"}
+	string %AbiTag{"win64-msvc19-0.12.0-abi7-dev"}
 
 	// ---- presentation ---------------------------------------------------------
 	string %DisplayName{"Modeling"}
@@ -50,6 +50,8 @@ Also converts Grey Boxing shapes and meshes into brushes, exports to OBJ, bakes 
 	Component { string %Name{"assets"} string %Platform{"any"} }
 	Component { string %Name{"manifest"} string %Platform{"any"} }
 	Component { string %Name{"runtime-win64"} string %Platform{"win64"} }
+	Component { string %Name{"runtime-linux64"} string %Platform{"linux64"} string %AbiTag{"linux64-clang18-0.12.0-abi7-dev"} }
+	Component { string %Name{"runtime-macos64"} string %Platform{"macos64"} string %AbiTag{"macosarm64-clang17-0.12.0-abi7-dev"} }
 	Component { string %Name{"editor-win64"} string %Platform{"win64"} string %Path{"Bin/Windows_x64_Development/plEditorPluginModelingMcp.dll"} }
 	Component { string %Name{"icon"} string %Platform{"any"} }
 	Component { string %Name{"banner"} string %Platform{"any"} }
