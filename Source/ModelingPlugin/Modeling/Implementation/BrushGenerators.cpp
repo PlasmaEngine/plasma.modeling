@@ -6,7 +6,8 @@
 PL_BEGIN_STATIC_REFLECTED_ENUM(plBrushShape, 1)
   PL_ENUM_CONSTANTS(plBrushShape::Box, plBrushShape::RampX, plBrushShape::RampY, plBrushShape::Column)
   PL_ENUM_CONSTANTS(plBrushShape::StairsX, plBrushShape::StairsY, plBrushShape::ArchX, plBrushShape::ArchY)
-  PL_ENUM_CONSTANTS(plBrushShape::SpiralStairs, plBrushShape::Editable)
+  PL_ENUM_CONSTANTS(plBrushShape::SpiralStairs, plBrushShape::Sphere, plBrushShape::Cone, plBrushShape::Pyramid)
+  PL_ENUM_CONSTANTS(plBrushShape::Editable)
 PL_END_STATIC_REFLECTED_ENUM;
 // clang-format on
 
@@ -67,11 +68,12 @@ namespace
       mesh.AddVertex(plVec3(h.x, h.y, h.z)),    // 5 back top right
     };
 
-    const plUInt32 slope[4] = {c[0], c[3], c[5], c[4]};
+    // CCW as seen from outside
+    const plUInt32 slope[4] = {c[0], c[4], c[5], c[3]};
     const plUInt32 bottom[4] = {c[3], c[2], c[1], c[0]};
     const plUInt32 back[4] = {c[1], c[2], c[5], c[4]};
-    const plUInt32 left[3] = {c[0], c[4], c[1]};
-    const plUInt32 right[3] = {c[3], c[2], c[5]};
+    const plUInt32 left[3] = {c[0], c[1], c[4]};
+    const plUInt32 right[3] = {c[3], c[5], c[2]};
 
     mesh.AddFace(plArrayPtr<const plUInt32>(slope, 4), Kind::MakeId(Kind::Slope));
     mesh.AddFace(plArrayPtr<const plUInt32>(bottom, 4), Kind::MakeId(Kind::Bottom));
@@ -124,6 +126,127 @@ namespace
       cap.PushBack(bottomRing[s - 1]);
     }
     mesh.AddFace(plArrayPtr<const plUInt32>(cap.GetData(), cap.GetCount()), Kind::MakeId(Kind::Bottom));
+  }
+
+  /// Cone inscribed in the box: an elliptic base at the bottom, apex at the top center.
+  void GenerateCone(const plVec3& vSize, plUInt32 uiDetail, plEditableMesh& mesh)
+  {
+    const plUInt32 uiSegments = plMath::Clamp<plUInt32>(uiDetail, 3, 64);
+    const plVec3 h = vSize * 0.5f;
+
+    mesh.BeginShell(true);
+
+    plSmallArray<plUInt32, 64> baseRing;
+
+    for (plUInt32 s = 0; s < uiSegments; ++s)
+    {
+      const plAngle a = plAngle::MakeFromRadian(2.0f * plMath::Pi<float>() * s / uiSegments);
+      baseRing.PushBack(mesh.AddVertex(plVec3(plMath::Cos(a) * h.x, plMath::Sin(a) * h.y, -h.z)));
+    }
+
+    const plUInt32 uiApex = mesh.AddVertex(plVec3(0, 0, h.z));
+
+    for (plUInt32 s = 0; s < uiSegments; ++s)
+    {
+      const plUInt32 side[3] = {baseRing[s], baseRing[(s + 1) % uiSegments], uiApex};
+      mesh.AddFace(plArrayPtr<const plUInt32>(side, 3), Kind::MakeId(Kind::Side, s));
+    }
+
+    plSmallArray<plUInt32, 64> cap;
+
+    for (plUInt32 s = uiSegments; s > 0; --s)
+    {
+      cap.PushBack(baseRing[s - 1]);
+    }
+    mesh.AddFace(plArrayPtr<const plUInt32>(cap.GetData(), cap.GetCount()), Kind::MakeId(Kind::Bottom));
+  }
+
+  /// Four-sided pyramid: the box's bottom face as the base, apex at the top center.
+  void GeneratePyramid(const plVec3& vSize, plEditableMesh& mesh)
+  {
+    const plVec3 h = vSize * 0.5f;
+
+    mesh.BeginShell(true);
+
+    const plUInt32 c[5] = {
+      mesh.AddVertex(plVec3(-h.x, -h.y, -h.z)), // 0
+      mesh.AddVertex(plVec3(h.x, -h.y, -h.z)),  // 1
+      mesh.AddVertex(plVec3(h.x, h.y, -h.z)),   // 2
+      mesh.AddVertex(plVec3(-h.x, h.y, -h.z)),  // 3
+      mesh.AddVertex(plVec3(0, 0, h.z)),        // 4 apex
+    };
+
+    // CCW as seen from outside, same corner order as the box
+    const plUInt32 bottom[4] = {c[3], c[2], c[1], c[0]};
+    const plUInt32 negY[3] = {c[0], c[1], c[4]};
+    const plUInt32 posX[3] = {c[1], c[2], c[4]};
+    const plUInt32 posY[3] = {c[2], c[3], c[4]};
+    const plUInt32 negX[3] = {c[3], c[0], c[4]};
+
+    mesh.AddFace(plArrayPtr<const plUInt32>(bottom, 4), Kind::MakeId(Kind::Bottom));
+    mesh.AddFace(plArrayPtr<const plUInt32>(negY, 3), Kind::MakeId(Kind::NegY));
+    mesh.AddFace(plArrayPtr<const plUInt32>(posX, 3), Kind::MakeId(Kind::PosX));
+    mesh.AddFace(plArrayPtr<const plUInt32>(posY, 3), Kind::MakeId(Kind::PosY));
+    mesh.AddFace(plArrayPtr<const plUInt32>(negX, 3), Kind::MakeId(Kind::NegX));
+  }
+
+  /// UV sphere (an ellipsoid filling the box): uiDetail segments around Z, half as many bands from pole
+  /// to pole. Every quad spans two parallel rings, so it is planar and the shell stays convex.
+  void GenerateSphere(const plVec3& vSize, plUInt32 uiDetail, plEditableMesh& mesh)
+  {
+    const plUInt32 uiSegments = plMath::Clamp<plUInt32>(uiDetail, 3, 64);
+    const plUInt32 uiBands = plMath::Max<plUInt32>(2, uiSegments / 2);
+    const plVec3 h = vSize * 0.5f;
+
+    mesh.BeginShell(true);
+
+    const plUInt32 uiNorth = mesh.AddVertex(plVec3(0, 0, h.z));
+
+    // rings[r * uiSegments + s], from the north pole downwards
+    plDynamicArray<plUInt32> rings;
+
+    for (plUInt32 r = 1; r < uiBands; ++r)
+    {
+      const plAngle polar = plAngle::MakeFromRadian(plMath::Pi<float>() * r / uiBands);
+      const float fRingRadius = plMath::Sin(polar);
+      const float z = plMath::Cos(polar) * h.z;
+
+      for (plUInt32 s = 0; s < uiSegments; ++s)
+      {
+        const plAngle a = plAngle::MakeFromRadian(2.0f * plMath::Pi<float>() * s / uiSegments);
+        rings.PushBack(mesh.AddVertex(plVec3(plMath::Cos(a) * fRingRadius * h.x, plMath::Sin(a) * fRingRadius * h.y, z)));
+      }
+    }
+
+    const plUInt32 uiSouth = mesh.AddVertex(plVec3(0, 0, -h.z));
+    const plUInt32 uiRingCount = uiBands - 1;
+
+    for (plUInt32 s = 0; s < uiSegments; ++s)
+    {
+      const plUInt32 n = (s + 1) % uiSegments;
+
+      // north cap triangle
+      {
+        const plUInt32 tri[3] = {rings[s], rings[n], uiNorth};
+        mesh.AddFace(plArrayPtr<const plUInt32>(tri, 3), Kind::MakeId(Kind::Side, s));
+      }
+
+      // bands between ring r (upper) and r + 1 (lower)
+      for (plUInt32 r = 0; r + 1 < uiRingCount; ++r)
+      {
+        const plUInt32 upper = r * uiSegments;
+        const plUInt32 lower = (r + 1) * uiSegments;
+        const plUInt32 quad[4] = {rings[lower + s], rings[lower + n], rings[upper + n], rings[upper + s]};
+        mesh.AddFace(plArrayPtr<const plUInt32>(quad, 4), Kind::MakeId(Kind::Side, (r + 1) * uiSegments + s));
+      }
+
+      // south cap triangle
+      {
+        const plUInt32 last = (uiRingCount - 1) * uiSegments;
+        const plUInt32 tri[3] = {uiSouth, rings[last + n], rings[last + s]};
+        mesh.AddFace(plArrayPtr<const plUInt32>(tri, 3), Kind::MakeId(Kind::Side, uiBands * uiSegments + s));
+      }
+    }
   }
 
   /// N closed box steps rising towards +X. With curvature, each step is rotated progressively around
@@ -277,12 +400,43 @@ void plBrushGenerators::Generate(plBrushShape::Enum shape, const plBrushGenerato
       break;
 
     case plBrushShape::ArchX:
-    case plBrushShape::ArchY:
-      GenerateArch(vSize, params.m_uiDetail, params.m_fThickness, params.m_Curvature, false, out_mesh);
+    {
+      // an upright ring spanning X, its depth along Y: built around Z, then turned +90 degrees about X
+      GenerateArch(plVec3(vSize.x, vSize.z, vSize.y), params.m_uiDetail, params.m_fThickness, params.m_Curvature, false, out_mesh);
+
+      for (plVec3& v : out_mesh.m_Vertices)
+      {
+        v = plVec3(v.x, -v.z, v.y);
+      }
       break;
+    }
+
+    case plBrushShape::ArchY:
+    {
+      // an upright ring spanning Y, its depth along X
+      GenerateArch(plVec3(vSize.y, vSize.z, vSize.x), params.m_uiDetail, params.m_fThickness, params.m_Curvature, false, out_mesh);
+
+      for (plVec3& v : out_mesh.m_Vertices)
+      {
+        v = plVec3(v.z, v.x, v.y);
+      }
+      break;
+    }
 
     case plBrushShape::SpiralStairs:
       GenerateArch(vSize, params.m_uiDetail, params.m_fThickness, params.m_Curvature, true, out_mesh);
+      break;
+
+    case plBrushShape::Sphere:
+      GenerateSphere(vSize, params.m_uiDetail, out_mesh);
+      break;
+
+    case plBrushShape::Cone:
+      GenerateCone(vSize, params.m_uiDetail, out_mesh);
+      break;
+
+    case plBrushShape::Pyramid:
+      GeneratePyramid(vSize, out_mesh);
       break;
 
     case plBrushShape::Editable:

@@ -6,6 +6,7 @@
 #include <Foundation/Containers/SmallArray.h>
 #include <Foundation/Math/Angle.h>
 #include <Foundation/Math/BoundingBox.h>
+#include <Foundation/Math/Transform.h>
 #include <Foundation/Math/Vec2.h>
 #include <Foundation/Math/Vec3.h>
 #include <Foundation/Types/VariantType.h>
@@ -30,6 +31,29 @@ struct PL_MODELINGPLUGIN_DLL plBrushFaceUV
   bool m_bWorldAligned = true;
 };
 
+/// \brief Face id ranges. Ids below c_uiDerivedBit come from generators and the mesh's own counter;
+/// ids with the bit set are derived (cut faces keyed by cutter id and plane) and never advance the counter.
+struct PL_MODELINGPLUGIN_DLL plBrushFaceIds
+{
+  static constexpr plUInt32 c_uiDerivedBit = 0x80000000u;
+
+  static constexpr bool IsDerived(plUInt32 uiFaceId) { return (uiFaceId & c_uiDerivedBit) != 0; }
+
+  /// \brief The id of every face a cutter's plane leaves behind. Stable under cutter moves and reordering.
+  static plUInt32 MakeCutFaceId(plUInt32 uiCutterId, plUInt32 uiShell, plUInt32 uiPlane, bool bOutsidePiece);
+};
+
+struct plBrushFaceFlags
+{
+  enum Enum : plUInt8
+  {
+    None = 0,
+    HardEdges = PL_BIT(0),  ///< never shares smoothed normals with neighbours
+    ExplicitUV = PL_BIT(1), ///< m_CornerUVs are authoritative instead of the projection
+    Internal = PL_BIT(2),   ///< closes a shell for CSG but lies inside the solid: never rendered, collided or picked
+  };
+};
+
 /// \brief One polygonal face of a brush. Corners index into the mesh's vertex array, counter-clockwise.
 ///
 /// The face id is the linchpin of the system: generators emit SEMANTIC ids (the top of step 3 keeps its
@@ -39,8 +63,10 @@ struct PL_MODELINGPLUGIN_DLL plBrushFace
 {
   plUInt32 m_uiFaceId = 0;
   plUInt8 m_uiMaterialSlot = 0;
+  plUInt8 m_uiFlags = plBrushFaceFlags::None;
   plSmallArray<plUInt32, 4> m_Corners;
   plBrushFaceUV m_UV;
+  plSmallArray<plVec2, 4> m_CornerUVs; ///< one per corner, only with plBrushFaceFlags::ExplicitUV
 };
 
 /// \brief A connected component of the mesh — one closed solid (or open sheet).
@@ -97,14 +123,42 @@ public:
   /// \brief Axis-aligned bounds of all vertices. Invalid for an empty mesh.
   plBoundingBox ComputeBounds() const;
 
-  /// \brief Flat-shaded triangle-soup render geometry, faces sorted by material slot.
+  /// \brief Render geometry, faces sorted by material slot.
   ///
-  /// Emits fan triangles per face (faces are convex), duplicating vertices per face so normals stay hard.
-  /// World-aligned UVs are derived here from each face normal. out_ranges receives one entry per material
-  /// slot that has faces; polygon order in the geometry equals triangle order in the final index buffer.
-  void BuildRenderGeometry(plGeometry& out_geom, plDynamicArray<plBrushSubMeshRange>& out_ranges, const plColor& color) const;
+  /// Faces are ear-clipped in their own plane, so concave faces triangulate correctly. Corners whose
+  /// faces meet at less than smoothingAngle share an averaged normal (matched by position, so separate
+  /// shells smooth too); HardEdges faces and a zero angle stay flat. Projected UVs use local positions,
+  /// or pUVSpace-transformed positions when given (world-space tiling). out_ranges receives one entry
+  /// per material slot that has faces; polygon order equals triangle order in the final index buffer.
+  void BuildRenderGeometry(plGeometry& out_geom, plDynamicArray<plBrushSubMeshRange>& out_ranges, plAngle smoothingAngle = plAngle(), const plTransform* pUVSpace = nullptr) const;
+
+  /// \brief Freezes every projected UV into explicit per-corner UVs (as BuildRenderGeometry would compute
+  /// them), so the mapping survives moving the vertices into another space.
+  void ConvertToExplicitUVs(const plTransform* pUVSpace = nullptr);
+
+  /// \brief Transforms every vertex. A mirroring transform also reverses every face so normals stay outward.
+  void TransformVertices(const plTransform& transform);
+
+  /// \brief Triangulates one face into corner-index triples (indices into m_Corners, not vertices).
+  /// Ear clipping in the face plane; falls back to a fan for degenerate loops.
+  void TriangulateFace(plUInt32 uiFaceIndex, plDynamicArray<plUInt32>& out_cornerTriangles) const;
+
+  /// \brief Largest distance of any corner from the face's best-fit plane.
+  float ComputeFacePlanarityError(plUInt32 uiFaceIndex) const;
+
+  float ComputeFaceArea(plUInt32 uiFaceIndex) const;
+
+  /// \brief The shell index containing a face, or plInvalidIndex for meshes without shell records.
+  plUInt32 FindShellOfFace(plUInt32 uiFaceIndex) const;
+
+  /// \brief Structural validity: corner indices in range, >= 3 corners per face, shells covering the
+  /// face array in order. Anything that fails this must never reach geometry generation.
+  bool IsStructurallyValid() const;
 
   void Serialize(plStreamWriter& inout_stream) const;
+
+  /// \brief Reads any known format version and validates the result. A damaged or truncated blob
+  /// leaves the mesh empty and fails.
   plResult Deserialize(plStreamReader& inout_stream);
 
   void ToDataBuffer(plDataBuffer& out_buffer) const;
@@ -113,6 +167,11 @@ public:
   /// \brief Derives the Valve-220 world-aligned projection axes for a normal: the dominant axis picks the
   /// plane, so axis-aligned faces tile exactly and tilted faces get the nearest cardinal projection.
   static void GetWorldAlignedUVAxes(const plVec3& vNormal, plVec3& out_vUAxis, plVec3& out_vVAxis);
+
+  /// \brief The projection axes of a face (world-aligned or authored), rotated by its UV rotation.
+  void GetFaceUVAxes(plUInt32 uiFaceIndex, const plVec3& vNormal, plVec3& out_vUAxis, plVec3& out_vVAxis) const;
+
+  static plVec2 ComputeProjectedUV(const plBrushFaceUV& uv, const plVec3& vUAxis, const plVec3& vVAxis, const plVec3& vPos);
 
   plDynamicArray<plVec3> m_Vertices;
   plDynamicArray<plBrushFace> m_Faces;

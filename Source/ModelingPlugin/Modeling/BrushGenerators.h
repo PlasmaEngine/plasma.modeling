@@ -7,6 +7,7 @@
 
 /// \brief The parametric shapes a brush can generate. Mirrors plGreyBoxShape so artist muscle memory
 /// (and the GreyBox migration) transfers 1:1. Editable means the mesh no longer follows parameters.
+/// The values are serialized: new shapes go at the end.
 struct PL_MODELINGPLUGIN_DLL plBrushShape
 {
   using StorageType = plUInt8;
@@ -23,6 +24,9 @@ struct PL_MODELINGPLUGIN_DLL plBrushShape
     ArchY,
     SpiralStairs,
     Editable,
+    Sphere,
+    Cone,
+    Pyramid,
 
     Default = Box
   };
@@ -59,7 +63,7 @@ struct PL_MODELINGPLUGIN_DLL plBrushGeneratorParams
   float m_fSizeNegY = 1, m_fSizePosY = 1;
   float m_fSizeNegZ = 1, m_fSizePosZ = 1;
 
-  plUInt32 m_uiDetail = 16; ///< steps for stairs, segments for cylinder / arch
+  plUInt32 m_uiDetail = 16; ///< steps for stairs, segments for cylinder / arch / cone / sphere
   plAngle m_Curvature;      ///< sweep angle for arch / spiral (0 = full circle), curve for stairs
   float m_fThickness = 0.5f;
 

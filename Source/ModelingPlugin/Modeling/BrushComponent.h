@@ -5,6 +5,7 @@
 #include <Core/World/Component.h>
 #include <Core/World/World.h>
 #include <Foundation/Containers/HashTable.h>
+#include <ModelingPlugin/Modeling/BrushFaceAttributes.h>
 #include <ModelingPlugin/Modeling/BrushGenerators.h>
 #include <RendererCore/Components/RenderComponent.h>
 #include <RendererCore/Pipeline/RenderData.h>
@@ -23,15 +24,17 @@ struct plMsgSetCustomData;
 using plMeshResourceHandle = plTypedResourceHandle<class plMeshResource>;
 using plMaterialResourceHandle = plTypedResourceHandle<class plMaterialResource>;
 
-using plBrushComponentManager = plComponentManager<class plBrushComponent, plBlockStorageType::Compact>;
+// FreeList, not Compact: plBrushWorldModule keeps pointers to brushes, and compact storage moves a
+// component into the slot of every deleted one
+using plBrushComponentManager = plComponentManager<class plBrushComponent, plBlockStorageType::FreeList>;
 
 /// \brief Scene-native blockout geometry: parametric shapes with per-face materials, generated from an
 /// editable mesh. Renders, collides (via plMsgBuildStaticMesh at scene export), participates in navmesh
 /// generation and acts as an occluder — the modeling-tool successor to plGreyBoxComponent.
 ///
-/// Per-face material overrides live in the FaceData blob as (faceId -> slot) pairs, keyed by the
-/// generators' SEMANTIC face ids so assignments survive parameter changes. One render submesh is emitted
-/// per used material slot.
+/// Per-face overrides (material slot, UV projection, hard edges) live in the FaceData blob keyed by the
+/// generators' SEMANTIC face ids, so assignments survive parameter changes; they apply after CSG, so cut
+/// faces take overrides too. One render submesh is emitted per used material slot.
 class PL_MODELINGPLUGIN_DLL plBrushComponent : public plRenderComponent
 {
   PL_DECLARE_COMPONENT_TYPE(plBrushComponent, plRenderComponent, plBrushComponentManager);
@@ -59,6 +62,9 @@ protected:
 public:
   plBrushComponent();
   ~plBrushComponent();
+
+  /// \brief Asset guid of the material faces get when their slot has none (the Pattern blockout material).
+  static const char* GetDefaultMaterialId();
 
   void SetShape(plEnum<plBrushShape> shape);                // [ property ]
   plEnum<plBrushShape> GetShape() const { return m_Shape; } // [ property ]
@@ -102,9 +108,31 @@ public:
   void SetIncludeInNavmesh(bool b);                                // [ property ]
   bool GetIncludeInNavmesh() const { return m_bIncludeInNavmesh; } // [ property ]
 
-  /// \brief The per-face attribute blob: version byte + count + (faceId u32, materialSlot u8) pairs.
+  void SetUseAsOccluder(bool b);                               // [ property ]
+  bool GetUseAsOccluder() const { return m_bUseAsOccluder; }   // [ property ]
+
+  /// \brief Corners whose faces meet at less than this angle share a smoothed normal. 0 = flat shading.
+  void SetSmoothingAngle(plAngle angle);                            // [ property ]
+  plAngle GetSmoothingAngle() const { return m_SmoothingAngle; }    // [ property ]
+
+  /// \brief On: projected UVs follow the brush when it moves. Off: they are computed in world space, so
+  /// textures tile seamlessly across neighbouring brushes and slide when a brush moves.
+  void SetTextureLock(bool b);                              // [ property ]
+  bool GetTextureLock() const { return m_bTextureLock; }    // [ property ]
+
+  /// \brief Static brushes in a merging brush group become part of the group's merged mesh at export.
+  void SetMergeOnExport(bool b) { m_bMergeOnExport = b; }       // [ property ]
+  bool GetMergeOnExport() const { return m_bMergeOnExport; }    // [ property ]
+
+  /// \brief Persistent identity: cut faces are keyed by the cutter's id, and cutters evaluate in id
+  /// order. The editor assigns a unique id when a brush is created, pasted or duplicated.
+  void SetBrushId(plUInt32 uiId);                        // [ property ]
+  plUInt32 GetBrushId() const { return m_uiBrushId; }    // [ property ]
+
+  /// \brief The per-face attribute blob (plBrushFaceAttributeCodec).
   void SetFaceData(const plDataBuffer& data);                 // [ property ]
   const plDataBuffer& GetFaceData() const { return m_FaceData; } // [ property ]
+  const plBrushFaceAttributeMap& GetFaceAttributes() const { return m_FaceAttributes; }
 
   /// \brief The serialized plEditableMesh, authoritative once Shape is Editable. Empty while parametric.
   void SetStoredMesh(const plDataBuffer& data);                     // [ property ]
@@ -112,26 +140,33 @@ public:
 
   void SetMaterial(plUInt32 uiIndex, const plMaterialResourceHandle& hMaterial);
   plMaterialResourceHandle GetMaterial(plUInt32 uiIndex) const;
+  plUInt32 GetMaterialCount() const { return m_Materials.GetCount(); }
 
-  /// \brief Builds the current editable mesh: generator output with the FaceData overrides applied.
+  const plBrushGeneratorParams& GetGeneratorParams() const { return m_Params; }
+
+  /// \brief The authored base mesh: generator output, or the stored mesh once Shape is Editable. No
+  /// face attributes, no CSG. A damaged stored mesh gives an empty mesh.
   void BuildEditableMesh(plEditableMesh& out_mesh) const;
 
-  /// \brief The mesh after non-destructive CSG: the base mesh minus every overlapping subtractive
-  /// brush (world-module query). For subtractive brushes this is just the base mesh.
+  /// \brief The final mesh: the base mesh minus every cutter in the brush's scope (for additive brushes),
+  /// with the face attributes applied last.
   void BuildEvaluatedMesh(plEditableMesh& out_mesh) const;
 
-  /// \brief Hash over everything that shapes the geometry (not materials/colors) — the world module's
-  /// change detection key.
-  plUInt64 ComputeContentHash() const;
+  /// \brief Increments whenever an authored input of the geometry changes. The world module's change key.
+  plUInt32 GetAuthoredRevision() const { return m_uiAuthoredRevision; }
 
-  /// \brief Public mesh invalidation, used by the world module when an overlapping cutter changes.
-  void InvalidateBrushMesh() { InvalidateMesh(); }
+  /// \brief For cutters: whether every shell is convex. A non-convex cutter cuts nothing.
+  bool IsCutterConvex() const { return m_bCutterConvex; }
 
-  /// \brief Decodes a FaceData blob into a (faceId -> materialSlot) map. Tolerates empty and unknown versions.
-  static void ParseFaceData(const plDataBuffer& data, plHashTable<plUInt32, plUInt8>& out_overrides);
+  /// \brief True when the stored mesh failed to load. The brush then renders nothing.
+  bool HasDamagedMesh() const { return m_bDamagedMesh; }
 
-  /// \brief Encodes the override map into the FaceData blob format (both sides of the mirror share this codec).
-  static void WriteFaceData(const plHashTable<plUInt32, plUInt8>& overrides, plDataBuffer& out_data);
+  /// \brief Regenerates the mesh right away. Used by the world module when an overlapping cutter changes.
+  void InvalidateBrushMesh();
+
+  /// \brief Regenerates the mesh if a property change invalidated it. Called once per frame by the world
+  /// module, so a burst of property changes costs one regeneration.
+  void RebuildMeshIfDirty();
 
 protected:
   void OnBuildStaticMesh(plMsgBuildStaticMesh& msg) const;
@@ -147,7 +182,10 @@ protected:
   void Materials_Insert(plUInt32 uiIndex, plString sValue);   // [ property ]
   void Materials_Remove(plUInt32 uiIndex);                    // [ property ]
 
-  void InvalidateMesh();
+  void InvalidateMesh(); ///< marks the mesh for regeneration by the next RebuildMeshIfDirty
+  void RegenerateMesh();
+  void OnAuthoredChange();
+  const plTransform* GetUVSpace(plTransform& ref_storage) const;
   void GenerateMeshName(const plEditableMesh& mesh, plStringBuilder& out_sName) const;
   void GenerateMeshResourceDescriptor(plMeshResourceDescriptor& desc, const plEditableMesh& mesh) const;
   plMaterialResourceHandle ResolveMaterial(plUInt32 uiSlot) const;
@@ -164,12 +202,22 @@ protected:
   bool m_bGenerateCollision = true;
   bool m_bIncludeInNavmesh = true;
   bool m_bUseAsOccluder = true;
+  bool m_bTextureLock = true;
+  bool m_bMergeOnExport = true;
+  plAngle m_SmoothingAngle = plAngle::MakeFromDegree(40.0f);
+  plUInt32 m_uiBrushId = 0;
 
   plSmallArray<plMaterialResourceHandle, 2> m_Materials;
   plDataBuffer m_FaceData;
+  plBrushFaceAttributeMap m_FaceAttributes; ///< decoded m_FaceData
   plDataBuffer m_StoredMesh; ///< authoritative mesh once Shape is Editable; empty while parametric
 
+  plUInt32 m_uiAuthoredRevision = 0;
+  mutable bool m_bCutterConvex = true;
+  mutable bool m_bDamagedMesh = false;
+
   plMeshResourceHandle m_hMesh;
+  bool m_bMeshDirty = false;
 
   mutable plSharedPtr<const plRasterizerObject> m_pOccluderObject;
   mutable plInstanceDataOffset m_InstanceDataOffset;

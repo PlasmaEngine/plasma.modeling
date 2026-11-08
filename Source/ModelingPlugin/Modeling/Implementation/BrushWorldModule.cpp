@@ -1,6 +1,7 @@
 #include <ModelingPlugin/ModelingPluginPCH.h>
 
 #include <ModelingPlugin/Modeling/BrushComponent.h>
+#include <ModelingPlugin/Modeling/BrushGroupComponent.h>
 #include <ModelingPlugin/Modeling/BrushWorldModule.h>
 
 // clang-format off
@@ -28,23 +29,55 @@ void plBrushWorldModule::Initialize()
   }
 }
 
+void plBrushWorldModule::CaptureState(plBrushComponent* pComponent, BrushState& out_state) const
+{
+  out_state.m_Transform = pComponent->GetOwner()->GetGlobalTransform();
+  out_state.m_uiRevision = pComponent->GetAuthoredRevision();
+  out_state.m_bSubtractive = pComponent->GetSubtractive();
+  out_state.m_bHasRooms = !out_state.m_bSubtractive && !GetRoomShells(pComponent).m_Faces.IsEmpty();
+  out_state.m_pScope = plBrushGroupComponent::FindCutterScope(pComponent->GetOwner());
+  out_state.m_WorldBounds = pComponent->GetOwner()->GetGlobalBounds().GetBox();
+}
+
+const plEditableMesh& plBrushWorldModule::GetRoomShells(const plBrushComponent* pComponent) const
+{
+  CachedCutterMesh& cached = m_RoomMeshes[pComponent];
+
+  if (cached.m_uiRevision != pComponent->GetAuthoredRevision())
+  {
+    plEditableMesh mesh;
+    pComponent->BuildEditableMesh(mesh);
+    plBrushEvaluator::ExtractRoomShells(mesh, cached.m_Mesh);
+    cached.m_uiRevision = pComponent->GetAuthoredRevision();
+  }
+
+  return cached.m_Mesh;
+}
+
 void plBrushWorldModule::RegisterBrush(plBrushComponent* pComponent)
 {
   BrushState& state = m_Brushes[pComponent];
-  state.m_Transform = pComponent->GetOwner()->GetGlobalTransform();
-  state.m_uiContentHash = pComponent->ComputeContentHash();
-  state.m_bSubtractive = pComponent->GetSubtractive();
-  state.m_WorldBounds = pComponent->GetOwner()->GetGlobalBounds().GetBox();
+  CaptureState(pComponent, state);
 
-  // a cutter appearing must carve everything it already overlaps
-  if (state.m_bSubtractive && state.m_WorldBounds.IsValid())
+  if (!state.m_WorldBounds.IsValid())
+    return;
+
+  // a cutter appearing must carve everything it already overlaps; a room appearing may take over passages
+  if (state.m_bSubtractive)
   {
-    InvalidateOverlappingAdditives(state.m_WorldBounds);
+    InvalidateAroundCutters(state.m_WorldBounds, state.m_pScope, true);
+  }
+  else if (state.m_bHasRooms)
+  {
+    InvalidateAroundCutters(state.m_WorldBounds, state.m_pScope, false, pComponent);
   }
 }
 
 void plBrushWorldModule::DeregisterBrush(plBrushComponent* pComponent)
 {
+  m_CutterMeshes.Remove(pComponent);
+  m_RoomMeshes.Remove(pComponent);
+
   auto it = m_Brushes.Find(pComponent);
 
   if (!it.IsValid())
@@ -53,56 +86,148 @@ void plBrushWorldModule::DeregisterBrush(plBrushComponent* pComponent)
   const BrushState state = it.Value();
   m_Brushes.Remove(it);
 
-  if (state.m_bSubtractive && state.m_WorldBounds.IsValid())
+  if (!state.m_WorldBounds.IsValid())
+    return;
+
+  if (state.m_bSubtractive)
   {
-    InvalidateOverlappingAdditives(state.m_WorldBounds);
+    InvalidateAroundCutters(state.m_WorldBounds, state.m_pScope, true);
+  }
+  else if (state.m_bHasRooms)
+  {
+    InvalidateAroundCutters(state.m_WorldBounds, state.m_pScope, false);
   }
 }
 
-void plBrushWorldModule::QueryCutters(const plBoundingBox& worldBounds, plDynamicArray<const plBrushComponent*>& out_cutters) const
+void plBrushWorldModule::GatherCutters(const plBrushComponent* pTarget, const plBoundingBox& targetWorldBounds, plDynamicArray<plBrushCutterInput>& out_cutters, bool bForRooms) const
 {
   out_cutters.Clear();
 
-  for (auto it = m_Brushes.GetIterator(); it.IsValid(); ++it)
+  if (!targetWorldBounds.IsValid())
+    return;
+
+  const plGameObject* pScope = plBrushGroupComponent::FindCutterScope(pTarget->GetOwner());
+
+  plHybridArray<const plBrushComponent*, 8> found;
+
+  auto gather = [&](const plBoundingBox& bounds)
   {
-    if (!it.Value().m_bSubtractive)
-      continue;
+    found.Clear();
 
-    if (!it.Value().m_WorldBounds.IsValid() || !it.Value().m_WorldBounds.Overlaps(worldBounds))
-      continue;
+    for (auto it = m_Brushes.GetIterator(); it.IsValid(); ++it)
+    {
+      const plBrushComponent* pCutter = it.Key();
+      const BrushState& state = it.Value();
 
-    out_cutters.PushBack(it.Key());
+      if (pCutter == pTarget || !state.m_bSubtractive || state.m_pScope != pScope)
+        continue;
+
+      if (!state.m_WorldBounds.IsValid() || !state.m_WorldBounds.Overlaps(bounds))
+        continue;
+
+      found.PushBack(pCutter);
+    }
+  };
+
+  gather(targetWorldBounds);
+
+  if (bForRooms && !found.IsEmpty())
+  {
+    plBoundingBox reach = targetWorldBounds;
+
+    for (const plBrushComponent* pCutter : found)
+    {
+      reach.ExpandToInclude(m_Brushes.GetValue(const_cast<plBrushComponent*>(pCutter))->m_WorldBounds);
+    }
+
+    gather(reach);
   }
 
-  // deterministic evaluation order — the editor-side evaluation sorts the same way, which keeps cap
-  // face ids identical across processes
-  out_cutters.Sort([](const plBrushComponent* pA, const plBrushComponent* pB)
-    {
-      const plVec3 a = pA->GetOwner()->GetGlobalPosition();
-      const plVec3 b = pB->GetOwner()->GetGlobalPosition();
+  found.Sort([](const plBrushComponent* pA, const plBrushComponent* pB)
+    { return plBrushEvaluator::CutterLess(pA->GetBrushId(), pA->GetOwner()->GetGlobalPosition(), pB->GetBrushId(), pB->GetOwner()->GetGlobalPosition()); });
 
-      if (a.x != b.x)
-        return a.x < b.x;
-      if (a.y != b.y)
-        return a.y < b.y;
-      return a.z < b.z;
-    });
+  for (const plBrushComponent* pCutter : found)
+  {
+    // a cutter's mesh is rebuilt only when its authored inputs change, not per target
+    CachedCutterMesh& cached = m_CutterMeshes[pCutter];
+
+    if (cached.m_uiRevision != pCutter->GetAuthoredRevision())
+    {
+      pCutter->BuildEditableMesh(cached.m_Mesh);
+      cached.m_uiRevision = pCutter->GetAuthoredRevision();
+    }
+
+    plBrushCutterInput& input = out_cutters.ExpandAndGetRef();
+    input.m_Mesh = cached.m_Mesh;
+    input.m_GlobalTransform = pCutter->GetOwner()->GetGlobalTransform();
+    input.m_uiBrushId = pCutter->GetBrushId();
+    input.m_WorldBounds = m_Brushes.GetValue(const_cast<plBrushComponent*>(pCutter))->m_WorldBounds;
+  }
 }
 
-void plBrushWorldModule::InvalidateOverlappingAdditives(const plBoundingBox& worldBounds)
+void plBrushWorldModule::GatherRooms(const plBrushComponent* pTarget, plArrayPtr<const plBrushCutterInput> cutters, plDynamicArray<plBrushRoomInput>& out_rooms) const
 {
+  out_rooms.Clear();
+
+  if (cutters.IsEmpty())
+    return;
+
+  const plGameObject* pScope = plBrushGroupComponent::FindCutterScope(pTarget->GetOwner());
+
   for (auto it = m_Brushes.GetIterator(); it.IsValid(); ++it)
   {
-    if (it.Value().m_bSubtractive)
+    const plBrushComponent* pRoom = it.Key();
+    const BrushState& state = it.Value();
+
+    if (pRoom == pTarget || !state.m_bHasRooms || state.m_pScope != pScope || !state.m_WorldBounds.IsValid())
       continue;
 
-    if (it.Value().m_WorldBounds.IsValid() && it.Value().m_WorldBounds.Overlaps(worldBounds))
-    {
-      it.Key()->InvalidateBrushMesh();
+    bool bReached = false;
 
-      // the re-generated mesh may grow or shrink — refresh the cached bounds
-      it.Value().m_WorldBounds = it.Key()->GetOwner()->GetGlobalBounds().GetBox();
+    for (const plBrushCutterInput& cutter : cutters)
+    {
+      bReached |= cutter.m_WorldBounds.IsValid() && cutter.m_WorldBounds.Overlaps(state.m_WorldBounds);
     }
+
+    if (!bReached)
+      continue;
+
+    plBrushRoomInput& input = out_rooms.ExpandAndGetRef();
+    input.m_Mesh = GetRoomShells(pRoom);
+    input.m_GlobalTransform = pRoom->GetOwner()->GetGlobalTransform();
+    input.m_uiBrushId = pRoom->GetBrushId();
+  }
+}
+
+void plBrushWorldModule::InvalidateAroundCutters(const plBoundingBox& worldBounds, const plGameObject* pScope, bool bAllAdditives, const plBrushComponent* pExclude)
+{
+  // the region rooms can be affected in: the bounds plus every cutter reaching into them
+  plBoundingBox reach = worldBounds;
+
+  for (auto it = m_Brushes.GetIterator(); it.IsValid(); ++it)
+  {
+    const BrushState& state = it.Value();
+
+    if (state.m_bSubtractive && state.m_pScope == pScope && state.m_WorldBounds.IsValid() && state.m_WorldBounds.Overlaps(worldBounds))
+      reach.ExpandToInclude(state.m_WorldBounds);
+  }
+
+  for (auto it = m_Brushes.GetIterator(); it.IsValid(); ++it)
+  {
+    BrushState& state = it.Value();
+
+    if (it.Key() == pExclude || state.m_bSubtractive || state.m_pScope != pScope || !state.m_WorldBounds.IsValid())
+      continue;
+
+    const bool bAffected = (bAllAdditives && state.m_WorldBounds.Overlaps(worldBounds)) || (state.m_bHasRooms && state.m_WorldBounds.Overlaps(reach));
+
+    if (!bAffected)
+      continue;
+
+    it.Key()->InvalidateBrushMesh();
+
+    // the re-generated mesh may grow or shrink — refresh the cached bounds
+    state.m_WorldBounds = it.Key()->GetOwner()->GetGlobalBounds().GetBox();
   }
 }
 
@@ -115,43 +240,55 @@ void plBrushWorldModule::DetectChanges(const plWorldModule::UpdateContext& conte
     plBrushComponent* pComponent = it.Key();
     BrushState& state = it.Value();
 
+    // first, so the state captured below sees the new bounds
+    pComponent->RebuildMeshIfDirty();
+
     const plTransform transform = pComponent->GetOwner()->GetGlobalTransform();
-    const plUInt64 uiContentHash = pComponent->ComputeContentHash();
+    const plUInt32 uiRevision = pComponent->GetAuthoredRevision();
     const bool bSubtractive = pComponent->GetSubtractive();
+    const plGameObject* pScope = plBrushGroupComponent::FindCutterScope(pComponent->GetOwner());
 
     const bool bTransformChanged = transform != state.m_Transform;
-    const bool bContentChanged = uiContentHash != state.m_uiContentHash;
+    const bool bContentChanged = uiRevision != state.m_uiRevision;
     const bool bRoleChanged = bSubtractive != state.m_bSubtractive;
+    const bool bScopeChanged = pScope != state.m_pScope;
 
-    if (!bTransformChanged && !bContentChanged && !bRoleChanged)
+    if (!bTransformChanged && !bContentChanged && !bRoleChanged && !bScopeChanged)
       continue;
 
-    const plBoundingBox oldBounds = state.m_WorldBounds;
-
-    state.m_Transform = transform;
-    state.m_uiContentHash = uiContentHash;
-    state.m_bSubtractive = bSubtractive;
-    state.m_WorldBounds = pComponent->GetOwner()->GetGlobalBounds().GetBox();
+    const BrushState oldState = state;
+    CaptureState(pComponent, state);
 
     if (bSubtractive || bRoleChanged)
     {
       // a changed cutter re-carves everything it used to touch and everything it touches now
-      if (oldBounds.IsValid())
+      if (oldState.m_WorldBounds.IsValid() && (oldState.m_bSubtractive || bRoleChanged))
       {
-        InvalidateOverlappingAdditives(oldBounds);
+        InvalidateAroundCutters(oldState.m_WorldBounds, oldState.m_pScope, true);
       }
 
-      if (state.m_WorldBounds.IsValid() && (!oldBounds.IsValid() || !oldBounds.Contains(state.m_WorldBounds)))
+      if (state.m_WorldBounds.IsValid())
       {
-        InvalidateOverlappingAdditives(state.m_WorldBounds);
+        InvalidateAroundCutters(state.m_WorldBounds, state.m_pScope, true);
       }
 
       pComponent->InvalidateBrushMesh();
     }
-    else if (bTransformChanged)
+    else if (bTransformChanged || bScopeChanged)
     {
-      // a moved additive brush intersects a different set of cutters
+      // a moved or regrouped additive brush intersects a different set of cutters
       pComponent->InvalidateBrushMesh();
+      state.m_WorldBounds = pComponent->GetOwner()->GetGlobalBounds().GetBox();
+    }
+
+    // rooms sharing a cutter with this one may gain or lose its passage
+    if (!bSubtractive && (state.m_bHasRooms || oldState.m_bHasRooms))
+    {
+      if (oldState.m_WorldBounds.IsValid())
+        InvalidateAroundCutters(oldState.m_WorldBounds, oldState.m_pScope, false, pComponent);
+
+      if (state.m_WorldBounds.IsValid())
+        InvalidateAroundCutters(state.m_WorldBounds, state.m_pScope, false, pComponent);
     }
   }
 }

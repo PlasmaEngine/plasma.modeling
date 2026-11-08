@@ -7,7 +7,7 @@
 
 #include <EditorPluginModeling/EditorPluginModelingDLL.h>
 
-#include <EditorFramework/EditorApp/EditorApp.moc.h>
+#include <EditorFramework/EditorApp/EditorApp.h>
 #include <Foundation/Reflection/Reflection.h>
 #include <Foundation/Strings/StringBuilder.h>
 #include <GuiFoundation/Action/ActionManager.h>

@@ -7,23 +7,31 @@
 #include <ToolsFoundation/Object/DocumentObjectBase.h>
 #include <ToolsFoundation/Object/DocumentObjectManager.h>
 
+bool plBrushPicking::IsBrushComponent(const plDocumentObject* pObject)
+{
+  return pObject != nullptr && pObject->GetTypeAccessor().GetType()->GetTypeName() == "plBrushComponent";
+}
+
 plResult plBrushPicking::BuildMeshFromObject(const plDocumentObject* pComponent, plEditableMesh& out_mesh)
 {
   out_mesh.Clear();
 
-  if (pComponent == nullptr)
+  if (!IsBrushComponent(pComponent))
     return PL_FAILURE;
 
   const auto& acc = pComponent->GetTypeAccessor();
-
-  if (acc.GetType()->GetTypeName() != "plBrushComponent")
-    return PL_FAILURE;
 
   const plBrushShape::Enum shape = static_cast<plBrushShape::Enum>(acc.GetValue("Shape").ConvertTo<plInt32>());
 
   if (shape == plBrushShape::Editable)
   {
-    return out_mesh.FromDataBuffer(acc.GetValue("StoredMesh").ConvertTo<plDataBuffer>());
+    const plDataBuffer stored = acc.GetValue("StoredMesh").ConvertTo<plDataBuffer>();
+
+    // an empty stored mesh is a valid (empty) brush, a damaged one is not
+    if (stored.IsEmpty())
+      return PL_SUCCESS;
+
+    return out_mesh.FromDataBuffer(stored);
   }
 
   plBrushGeneratorParams params;
@@ -41,6 +49,11 @@ plResult plBrushPicking::BuildMeshFromObject(const plDocumentObject* pComponent,
   return PL_SUCCESS;
 }
 
+void plBrushPicking::ReadFaceAttributes(const plDocumentObject* pComponent, plBrushFaceAttributeMap& out_attributes)
+{
+  plBrushFaceAttributeCodec::Parse(pComponent->GetTypeAccessor().GetValue("FaceData").ConvertTo<plDataBuffer>(), out_attributes);
+}
+
 plTransform plBrushPicking::GetComponentGlobalTransform(const plDocumentObject* pComponent)
 {
   const plGameObjectDocument* pGameDoc = plDynamicCast<const plGameObjectDocument*>(pComponent->GetDocumentObjectManager()->GetDocument());
@@ -51,94 +64,214 @@ plTransform plBrushPicking::GetComponentGlobalTransform(const plDocumentObject* 
   return pGameDoc->GetGlobalTransform(pComponent->GetParent());
 }
 
-namespace
+const plDocumentObject* plBrushPicking::FindCutterScope(const plDocumentObject* pComponent)
 {
-  void CollectCuttersRecursive(const plDocumentObject* pObject, const plDocumentObject* pExclude, plDynamicArray<const plDocumentObject*>& out_cutters)
+  const plDocumentObject* pRoot = pComponent->GetDocumentObjectManager()->GetRootObject();
+
+  for (const plDocumentObject* pObject = pComponent->GetParent(); pObject != nullptr && pObject != pRoot; pObject = pObject->GetParent())
   {
     for (const plDocumentObject* pChild : pObject->GetChildren())
     {
-      if (pChild != pExclude && pChild->GetTypeAccessor().GetType()->GetTypeName() == "plBrushComponent")
+      if (pChild->GetTypeAccessor().GetType()->GetTypeName() == "plBrushGroupComponent" &&
+          pChild->GetTypeAccessor().GetValue("IsolateCutters").ConvertTo<bool>())
       {
-        if (pChild->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>())
-        {
-          out_cutters.PushBack(pChild);
-        }
+        return pObject;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+namespace
+{
+  void CollectBrushesRecursive(const plDocumentObject* pObject, plDynamicArray<const plDocumentObject*>& out_brushes)
+  {
+    for (const plDocumentObject* pChild : pObject->GetChildren())
+    {
+      if (plBrushPicking::IsBrushComponent(pChild))
+      {
+        out_brushes.PushBack(pChild);
       }
 
-      CollectCuttersRecursive(pChild, pExclude, out_cutters);
+      CollectBrushesRecursive(pChild, out_brushes);
     }
   }
 } // namespace
 
-void plBrushPicking::FindCutterComponents(const plDocumentObject* pAnyDocumentObject, const plDocumentObject* pExclude, plDynamicArray<const plDocumentObject*>& out_cutters)
+void plBrushPicking::FindAllBrushComponents(const plDocumentObject* pAnyDocumentObject, plDynamicArray<const plDocumentObject*>& out_brushes)
+{
+  out_brushes.Clear();
+  CollectBrushesRecursive(pAnyDocumentObject->GetDocumentObjectManager()->GetRootObject(), out_brushes);
+}
+
+void plBrushPicking::GatherCutters(const plDocumentObject* pTarget, const plBoundingBox& targetWorldBounds, plDynamicArray<plBrushCutterInput>& out_cutters, plDynamicArray<const plDocumentObject*>* out_pCutterObjects, bool bForRooms)
 {
   out_cutters.Clear();
 
-  const plDocumentObject* pRoot = pAnyDocumentObject->GetDocumentObjectManager()->GetRootObject();
+  if (out_pCutterObjects)
+    out_pCutterObjects->Clear();
 
-  CollectCuttersRecursive(pRoot, pExclude, out_cutters);
+  if (!targetWorldBounds.IsValid())
+    return;
 
-  // same deterministic order as plBrushWorldModule::QueryCutters — cap face ids must match
-  out_cutters.Sort([](const plDocumentObject* pA, const plDocumentObject* pB)
+  const plDocumentObject* pScope = FindCutterScope(pTarget);
+
+  plDynamicArray<const plDocumentObject*> brushes;
+  FindAllBrushComponents(pTarget, brushes);
+
+  struct Candidate
+  {
+    const plDocumentObject* m_pObject;
+    plUInt32 m_uiBrushId;
+    plTransform m_Transform;
+  };
+
+  plHybridArray<Candidate, 8> candidates;
+
+  for (const plDocumentObject* pBrush : brushes)
+  {
+    if (pBrush == pTarget || !pBrush->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>())
+      continue;
+
+    if (FindCutterScope(pBrush) != pScope)
+      continue;
+
+    Candidate& c = candidates.ExpandAndGetRef();
+    c.m_pObject = pBrush;
+    c.m_uiBrushId = pBrush->GetTypeAccessor().GetValue("BrushId").ConvertTo<plUInt32>();
+    c.m_Transform = GetComponentGlobalTransform(pBrush);
+  }
+
+  candidates.Sort([](const Candidate& a, const Candidate& b)
+    { return plBrushEvaluator::CutterLess(a.m_uiBrushId, a.m_Transform.m_vPosition, b.m_uiBrushId, b.m_Transform.m_vPosition); });
+
+  plDynamicArray<plBrushCutterInput> all;
+  plDynamicArray<const plDocumentObject*> allObjects;
+
+  for (const Candidate& c : candidates)
+  {
+    plBrushCutterInput input;
+
+    if (BuildMeshFromObject(c.m_pObject, input.m_Mesh).Failed() || input.m_Mesh.m_Faces.IsEmpty())
+      continue;
+
+    input.m_GlobalTransform = c.m_Transform;
+    input.m_uiBrushId = c.m_uiBrushId;
+    input.m_WorldBounds = input.m_Mesh.ComputeBounds();
+    input.m_WorldBounds.TransformFromOrigin(c.m_Transform.GetAsMat4());
+
+    all.PushBack(std::move(input));
+    allObjects.PushBack(c.m_pObject);
+  }
+
+  // a room's passage ends where another cutter begins: rooms also see the cutters next to their own
+  plBoundingBox reach = targetWorldBounds;
+
+  if (bForRooms)
+  {
+    for (const plBrushCutterInput& input : all)
     {
-      const plVec3 a = plBrushPicking::GetComponentGlobalTransform(pA).m_vPosition;
-      const plVec3 b = plBrushPicking::GetComponentGlobalTransform(pB).m_vPosition;
+      if (input.m_WorldBounds.Overlaps(targetWorldBounds))
+        reach.ExpandToInclude(input.m_WorldBounds);
+    }
+  }
 
-      if (a.x != b.x)
-        return a.x < b.x;
-      if (a.y != b.y)
-        return a.y < b.y;
-      return a.z < b.z;
-    });
+  for (plUInt32 i = 0; i < all.GetCount(); ++i)
+  {
+    if (!all[i].m_WorldBounds.Overlaps(reach))
+      continue;
+
+    out_cutters.PushBack(std::move(all[i]));
+
+    if (out_pCutterObjects)
+      out_pCutterObjects->PushBack(allObjects[i]);
+  }
 }
 
-plResult plBrushPicking::BuildEvaluatedMeshFromObject(const plDocumentObject* pComponent, plEditableMesh& out_mesh)
+void plBrushPicking::GatherRooms(const plDocumentObject* pTarget, plArrayPtr<const plBrushCutterInput> cutters, plDynamicArray<plBrushRoomInput>& out_rooms)
+{
+  out_rooms.Clear();
+
+  if (cutters.IsEmpty())
+    return;
+
+  const plDocumentObject* pScope = FindCutterScope(pTarget);
+
+  plDynamicArray<const plDocumentObject*> brushes;
+  FindAllBrushComponents(pTarget, brushes);
+
+  plEditableMesh mesh;
+
+  for (const plDocumentObject* pBrush : brushes)
+  {
+    if (pBrush == pTarget || pBrush->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>() || FindCutterScope(pBrush) != pScope)
+      continue;
+
+    if (BuildMeshFromObject(pBrush, mesh).Failed() || !plMeshCSG::HasInvertedShell(mesh))
+      continue;
+
+    const plTransform transform = GetComponentGlobalTransform(pBrush);
+
+    // the engine compares against the rendered bounds, which for a room are its own shell's
+    plBoundingBox bounds = mesh.ComputeBounds();
+    bounds.TransformFromOrigin(transform.GetAsMat4());
+
+    bool bReached = false;
+
+    for (const plBrushCutterInput& cutter : cutters)
+    {
+      bReached |= cutter.m_WorldBounds.Overlaps(bounds);
+    }
+
+    if (!bReached)
+      continue;
+
+    plBrushRoomInput& input = out_rooms.ExpandAndGetRef();
+    plBrushEvaluator::ExtractRoomShells(mesh, input.m_Mesh);
+    input.m_GlobalTransform = transform;
+    input.m_uiBrushId = pBrush->GetTypeAccessor().GetValue("BrushId").ConvertTo<plUInt32>();
+  }
+}
+
+void plBrushPicking::CarveMesh(const plDocumentObject* pComponent, plEditableMesh& inout_mesh, plArrayPtr<const plBrushCutterInput> cutters, plDynamicArray<plUInt32>* out_pRefusedCutters)
+{
+  plDynamicArray<plBrushRoomInput> rooms;
+  plBrushRoomContext roomContext;
+  roomContext.m_uiTargetBrushId = pComponent->GetTypeAccessor().GetValue("BrushId").ConvertTo<plUInt32>();
+
+  if (plMeshCSG::HasInvertedShell(inout_mesh))
+  {
+    GatherRooms(pComponent, cutters, rooms);
+    roomContext.m_OtherRooms = rooms.GetArrayPtr();
+  }
+
+  plBrushEvaluator::Carve(inout_mesh, GetComponentGlobalTransform(pComponent), cutters, out_pRefusedCutters, &roomContext);
+}
+
+plResult plBrushPicking::BuildEvaluatedMeshFromObject(const plDocumentObject* pComponent, plEditableMesh& out_mesh, plDynamicArray<plUInt32>* out_pRefusedCutters)
 {
   if (BuildMeshFromObject(pComponent, out_mesh).Failed())
     return PL_FAILURE;
 
+  plBrushFaceAttributeMap attributes;
+  ReadFaceAttributes(pComponent, attributes);
+
   const bool bSubtractive = pComponent->GetTypeAccessor().GetValue("Subtractive").ConvertTo<bool>();
-
-  if (bSubtractive || out_mesh.m_Faces.IsEmpty())
-    return PL_SUCCESS;
-
-  plDynamicArray<const plDocumentObject*> cutters;
-  FindCutterComponents(pComponent, pComponent, cutters);
-
-  if (cutters.IsEmpty())
-    return PL_SUCCESS;
-
   const plTransform targetTransform = GetComponentGlobalTransform(pComponent);
 
-  plBoundingBox targetWorldBounds = out_mesh.ComputeBounds();
-  targetWorldBounds.TransformFromOrigin(targetTransform.GetAsMat4());
-
-  plEditableMesh cutterMesh, result;
-
-  for (const plDocumentObject* pCutter : cutters)
+  if (!bSubtractive && !out_mesh.m_Faces.IsEmpty())
   {
-    if (BuildMeshFromObject(pCutter, cutterMesh).Failed() || cutterMesh.m_Faces.IsEmpty())
-      continue;
+    plBoundingBox targetWorldBounds = out_mesh.ComputeBounds();
+    targetWorldBounds.TransformFromOrigin(targetTransform.GetAsMat4());
 
-    const plTransform cutterTransform = GetComponentGlobalTransform(pCutter);
+    plDynamicArray<plBrushCutterInput> cutters;
+    GatherCutters(pComponent, targetWorldBounds, cutters, nullptr, plMeshCSG::HasInvertedShell(out_mesh));
 
-    plBoundingBox cutterWorldBounds = cutterMesh.ComputeBounds();
-    cutterWorldBounds.TransformFromOrigin(cutterTransform.GetAsMat4());
-
-    if (!cutterWorldBounds.Overlaps(targetWorldBounds))
-      continue;
-
-    const plTransform cutterToTarget = plTransform::MakeLocalTransform(targetTransform, cutterTransform);
-
-    if (plMeshCSG::SubtractCutter(out_mesh, cutterMesh, cutterToTarget, 0, result).Succeeded())
-    {
-      out_mesh = result;
-    }
-
-    if (out_mesh.m_Faces.IsEmpty())
-      break;
+    CarveMesh(pComponent, out_mesh, cutters, out_pRefusedCutters);
   }
 
+  plBrushFaceAttributeCodec::Apply(attributes, out_mesh);
   return PL_SUCCESS;
 }
 
@@ -157,40 +290,49 @@ plInt32 plBrushPicking::PickFaceIndexAtLocalPos(const plEditableMesh& mesh, cons
   plUInt32 uiBestFaceNoContainment = plInvalidIndex;
   float fBestDistNoContainment = plMath::MaxValue<float>();
 
+  plDynamicArray<plUInt32> tris;
+
   for (plUInt32 uiFace = 0; uiFace < mesh.m_Faces.GetCount(); ++uiFace)
   {
     const plBrushFace& face = mesh.m_Faces[uiFace];
-    const plVec3 vNormal = mesh.ComputeFaceNormal(uiFace);
-    const plVec3& vAnchor = mesh.m_Vertices[face.m_Corners[0]];
 
-    const float fPlaneDist = plMath::Abs(vNormal.Dot(vLocalPos - vAnchor));
-
-    if (fPlaneDist >= fBestDistNoContainment)
+    if ((face.m_uiFlags & plBrushFaceFlags::Internal) != 0)
       continue;
 
-    uiBestFaceNoContainment = uiFace;
-    fBestDistNoContainment = fPlaneDist;
+    const plVec3 vNormal = mesh.ComputeFaceNormal(uiFace);
+    const plVec3 vCenter = mesh.ComputeFaceCenter(uiFace);
+
+    const float fPlaneDist = plMath::Abs(vNormal.Dot(vLocalPos - vCenter));
+
+    if (fPlaneDist >= fBestDistNoContainment && fPlaneDist >= fBestDist)
+      continue;
+
+    if (fPlaneDist < fBestDistNoContainment)
+    {
+      uiBestFaceNoContainment = uiFace;
+      fBestDistNoContainment = fPlaneDist;
+    }
 
     if (fPlaneDist >= fBestDist)
       continue;
 
-    // containment: the point must lie inside every edge, testing in the face plane
-    bool bInside = true;
+    // containment against the face's triangles, so concave faces pick correctly; a small tolerance
+    // keeps edge and corner hits on a face
+    const plVec3 vOnPlane = vLocalPos - vNormal * vNormal.Dot(vLocalPos - vCenter);
+    mesh.TriangulateFace(uiFace, tris);
 
-    for (plUInt32 i = 0; i < face.m_Corners.GetCount(); ++i)
+    bool bInside = false;
+
+    for (plUInt32 t = 0; t + 2 < tris.GetCount() && !bInside; t += 3)
     {
-      const plVec3& vEdgeStart = mesh.m_Vertices[face.m_Corners[i]];
-      const plVec3& vEdgeEnd = mesh.m_Vertices[face.m_Corners[(i + 1) % face.m_Corners.GetCount()]];
+      const plVec3& a = mesh.m_Vertices[face.m_Corners[tris[t]]];
+      const plVec3& b = mesh.m_Vertices[face.m_Corners[tris[t + 1]]];
+      const plVec3& c = mesh.m_Vertices[face.m_Corners[tris[t + 2]]];
 
-      const plVec3 vEdge = vEdgeEnd - vEdgeStart;
-      const plVec3 vToPoint = vLocalPos - vEdgeStart;
-
-      // negative = outside this edge (corners wind CCW around the normal), with a small tolerance
-      // so edge and corner drops still land on a face
-      if (vNormal.Dot(vEdge.CrossRH(vToPoint)) < -0.001f)
+      if (vNormal.Dot((b - a).CrossRH(vOnPlane - a)) >= -0.001f && vNormal.Dot((c - b).CrossRH(vOnPlane - b)) >= -0.001f &&
+          vNormal.Dot((a - c).CrossRH(vOnPlane - c)) >= -0.001f)
       {
-        bInside = false;
-        break;
+        bInside = true;
       }
     }
 

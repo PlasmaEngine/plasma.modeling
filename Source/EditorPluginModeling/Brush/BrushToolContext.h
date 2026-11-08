@@ -7,11 +7,13 @@
 #include <EditorPluginModeling/EditorPluginModelingDLL.h>
 #include <Foundation/Containers/HashSet.h>
 #include <Foundation/Containers/HashTable.h>
+#include <Foundation/Types/Status.h>
 #include <Foundation/Types/UniquePtr.h>
 #include <ModelingPlugin/Modeling/EditableMesh.h>
 
 class plDrawBoxGizmo;
 class plGameObjectDocument;
+struct plObjectPickingResult;
 struct plDocumentObjectPropertyEvent;
 struct plDocumentObjectStructureEvent;
 
@@ -26,6 +28,16 @@ struct plBrushSubMode
   };
 };
 
+/// \brief What a click selects in Face mode.
+struct plBrushFaceGranularity
+{
+  enum Enum
+  {
+    Surface, ///< "CSG face": a whole face as rendered, all its CSG pieces and cut faces included
+    Polygon, ///< "Mesh face": one polygon of the brush's own mesh
+  };
+};
+
 class plBrushToolContext;
 
 /// \brief Broadcast whenever a brush context changes its sub-object mode, so UI (the Modeling panel's
@@ -36,6 +48,52 @@ struct plBrushModeEvent
   const plBrushToolContext* m_pContext = nullptr;
   const plGameObjectDocument* m_pDocument = nullptr;
   plBrushSubMode::Enum m_Mode = plBrushSubMode::Object;
+};
+
+/// \brief Broadcast when the sub-object selection or the target brush's mesh changes, so the Modeling
+/// panel can enable operations and show the selected faces' texture settings.
+struct plBrushSelectionEvent
+{
+  const plBrushToolContext* m_pContext = nullptr;
+  const plGameObjectDocument* m_pDocument = nullptr;
+};
+
+/// \brief Selection helpers on the current sub-object selection.
+struct plBrushSelectionOp
+{
+  enum Enum
+  {
+    All,
+    None,
+    Invert,
+    Grow,
+    Shrink,
+    Loop,         ///< edge mode: the loops through the selected edges
+    Ring,         ///< edge mode: the rings through the selected edges
+    SameMaterial, ///< face mode: every face sharing a selected face's material
+  };
+};
+
+/// \brief Polygon operations on the current sub-object selection.
+struct plBrushMeshOp
+{
+  enum Enum
+  {
+    Extrude,  ///< modal: drag sets the distance
+    Inset,    ///< modal
+    Bevel,    ///< modal, wheel or +/- for segments
+    LoopCut,  ///< modal slide, wheel or +/- for the number of cuts
+    Bridge,
+    Weld,
+    Flip,
+    Subdivide,
+    Detach,
+    Delete,
+    FillHole,
+    Connect,
+    Triangulate,
+    Flatten,
+  };
 };
 
 /// \brief The single input context for all brush editing while the Brush tool is active.
@@ -63,21 +121,96 @@ public:
   plBrushSubMode::Enum GetSubMode() const { return m_SubMode; }
   void SetSubMode(plBrushSubMode::Enum mode);
 
-  static plEvent<const plBrushModeEvent&> s_ModeEvents;
+  /// \brief Whether Face mode selects whole faces as rendered (CSG faces) or single polygons (mesh faces).
+  /// Selecting a mesh face that shares its id with other CSG pieces gives it its own id first (one undo
+  /// step), since everything face-related works by id. Broadcasts s_ModeEvents.
+  void SetFaceGranularity(plBrushFaceGranularity::Enum granularity);
+  plBrushFaceGranularity::Enum GetFaceGranularity() const { return m_FaceGranularity; }
 
-  virtual void UpdateStatusBarText(plQtEngineDocumentWindow* pWindow) override;
+  static plEvent<const plBrushModeEvent&> s_ModeEvents;
+  static plEvent<const plBrushSelectionEvent&> s_SelectionEvents;
+
+  /// \brief The brush component being edited in a sub-object mode, or nullptr.
+  const plDocumentObject* GetTargetBrush() const { return GetBrushObject(); }
+
+  const plHashSet<plUInt32>& GetSelectedVertices() const { return m_SelectedVertices; }
+  const plHashSet<plUInt64>& GetSelectedEdges() const { return m_SelectedEdges; }
+  const plHashSet<plUInt32>& GetSelectedFaces() const { return m_SelectedFaces; }
+
+  /// \brief The target brush's authored mesh, as the selection indices refer to it.
+  const plEditableMesh& GetBaseMesh() const { return m_BaseMesh; }
+
+  bool IsModalOperationActive() const { return m_ModalOp != ModalOp::None; }
+
+  void ApplySelectionOp(plBrushSelectionOp::Enum op);
+
+  /// \brief Replaces the sub-object selection (vertex indices, edge keys, face ids of the base mesh).
+  void SetSelection(const plHashSet<plUInt32>& vertices, const plHashSet<plUInt64>& edges, const plHashSet<plUInt32>& faces);
+
+  static plUInt64 MakeEdgeKey(plUInt32 uiV0, plUInt32 uiV1);
+
+  /// \brief Runs a polygon operation on the selection. Extrude, inset, bevel and loop cut start a modal
+  /// drag; the rest apply at once as one undo step.
+  plStatus RunMeshOp(plBrushMeshOp::Enum op);
+
+  /// \brief Starts the modal move (G) or scale (S) on the selection.
+  plStatus RunModalTransform(bool bScale);
+
+  /// \brief Starts the clip tool on the selected brushes: click three points to define the plane, Tab
+  /// cycles which side is kept, Enter applies, Esc cancels.
+  plStatus StartClip();
+
+  /// \brief Whether a key belongs to the Brush tool in its current state: it then runs the tool's command instead of
+  /// an editor-wide shortcut (1, G, W... mean something else outside the tool).
+  bool WantsKey(const plEditorInputEvent& e) const;
+
+  /// \brief Select-through: marquee selection also takes elements facing away from the camera.
+  /// Broadcasts s_ModeEvents, like SetShowHiddenHandles, so UI toggles follow key presses.
+  void SetSelectThrough(bool b);
+  bool GetSelectThrough() const { return m_bSelectThrough; }
+
+  /// \brief Element handles (the vertex / edge / face boxes) show through the brush when set; otherwise
+  /// handles behind the brush's own rendered surface are hidden, and so not pickable.
+  void SetShowHiddenHandles(bool b);
+  bool GetShowHiddenHandles() const { return m_bShowHiddenHandles; }
+
+  /// \brief True while a drag or modal operation writes preview meshes to the document. Listeners can
+  /// skip expensive refreshes until it ends.
+  bool IsPreviewing() const { return m_bInTemporaryCommands; }
+
+  /// \brief Re-tests handle occlusion if the camera moved since the last test. Polled by the view's mode
+  /// strip, since camera navigation does not go through this context.
+  void UpdateForCamera();
+
+  /// \brief Edit Pivot: a move gizmo on the brush's origin (the sub-object target, else the first selected
+  /// brush). Dragging it moves only the origin; the geometry stays where it is. Ctrl snaps like any move.
+  plStatus SetPivotEdit(bool bEnable);
+  bool IsPivotEditActive() const { return m_bPivotEdit; }
+
+  /// \brief Moves the edited brush's origin onto the center of the sub-object selection.
+  plStatus MovePivotToSelection();
+
+  /// \brief Opens the marking menu at the cursor, or at the centre of a view when the cursor is not over one (the
+  /// toolbar button).
+  void OpenMarkingMenu();
+
+  /// \brief Shown in the view's info line while drawing or editing: sizes, edge lengths, op amounts.
+  plStringView GetInfoText() const { return m_sInfoText; }
+
+  virtual void UpdateStatusBarText(plEngineDocumentWindow* pWindow) override;
 
 protected:
-  virtual void OnSetOwner(plQtEngineDocumentWindow* pOwnerWindow, plQtEngineViewWidget* pOwnerView) override;
+  virtual void OnSetOwner(plEngineDocumentWindow* pOwnerWindow, plEngineViewWidget* pOwnerView) override;
   virtual void OnVisibleChanged(bool bVisible) override {}
   virtual void OnTransformationChanged(const plTransform& transform) override {}
   virtual void DoFocusLost(bool bCancel) override;
 
-  virtual plEditorInput DoKeyPressEvent(QKeyEvent* e) override;
-  virtual plEditorInput DoKeyReleaseEvent(QKeyEvent* e) override;
-  virtual plEditorInput DoMousePressEvent(QMouseEvent* e) override;
-  virtual plEditorInput DoMouseReleaseEvent(QMouseEvent* e) override;
-  virtual plEditorInput DoMouseMoveEvent(QMouseEvent* e) override;
+  virtual plEditorInput DoKeyPressEvent(const plEditorInputEvent& e) override;
+  virtual plEditorInput DoKeyReleaseEvent(const plEditorInputEvent& e) override;
+  virtual plEditorInput DoMousePressEvent(const plEditorInputEvent& e) override;
+  virtual plEditorInput DoMouseReleaseEvent(const plEditorInputEvent& e) override;
+  virtual plEditorInput DoMouseMoveEvent(const plEditorInputEvent& e) override;
+  virtual plEditorInput DoWheelEvent(const plEditorInputEvent& e) override;
 
 private:
   struct ModalOp
@@ -88,6 +221,10 @@ private:
       Move,
       Rotate,
       Scale,
+      Extrude,
+      Inset,
+      Bevel,
+      LoopCut,
     };
   };
 
@@ -123,13 +260,26 @@ private:
   // owner object) must refresh the cached mesh, the cubes and the gizmo
   void PropertyEventHandler(const plDocumentObjectPropertyEvent& e);
   void StructureEventHandler(const plDocumentObjectStructureEvent& e);
+  void DocumentManagerEventHandler(const plDocumentManager::Event& e);
   void RefreshFromDocument();
 
   // picking & selection
-  bool PickAt(const QPoint& viewPos, HoverHit& out_hit);
+  bool PickAt(const plVec2I32& vViewPos, HoverHit& out_hit);
   void ApplyClickSelection(const HoverHit& hit, bool bAdditive);
   void GatherSelectedVertices(plHashSet<plUInt32>& out_vertices) const;
-  static plUInt64 MakeEdgeKey(plUInt32 uiV0, plUInt32 uiV1);
+
+  /// Plain: the ids become the face selection. bAdditive toggles them as one unit (removed when all are
+  /// selected already, else added). bSubtract removes them.
+  void SelectFaceIds(const plHashSet<plUInt32>& ids, bool bAdditive, bool bSubtract);
+
+  /// The ids of the listed authored polygons, separated first where CSG pieces share an id.
+  void GetPolygonIds(plArrayPtr<const plUInt32> faceIndices, plHashSet<plUInt32>& out_ids);
+
+  // CSG faces: the brush as rendered (cut, attributes applied) grouped into surfaces
+  bool UsesSurfaces() const;
+  const plEditableMesh& GetSurfaceMesh() const;
+  void UpdateSurfaces() const;
+  void GatherSurfaceIds(plUInt32 uiSurface, plHashSet<plUInt32>& out_ids) const;
 
   struct ActiveGizmo
   {
@@ -144,12 +294,16 @@ private:
 
   // modal operation
   void BeginModalOp(ModalOp::Enum op);
+  bool HasViewForModalOp() const;
   void UpdateModalPreview();
   void CommitModalOp();
   void CancelModalOp();
   void EndModalCommon();
   void WritePreview(const plEditableMesh& mesh, bool bFinal);
-  plResult PickOnWorkPlane(const QPoint& viewPos, plVec3& out_vPoint) const;
+  plResult PickOnWorkPlane(const plVec2I32& vViewPos, plVec3& out_vPoint) const;
+
+  /// The cursor in the owner view, in logical units from its top-left; false without an owner view.
+  bool GetCursorInView(plVec2I32& out_vViewPos) const;
   plVec3 GetAxisVector() const;
 
   /// Rebuilds the preview from the base mesh: rotate/scale around m_vPivot, then translate — in
@@ -164,11 +318,50 @@ private:
   void GizmoEventHandler(const plGizmoEvent& e);
   plResult ComputeSelectionPivot(plVec3& out_vPivot);
 
+  /// The shown gizmo's handle under the cursor (picked earlier, as res), or nullptr.
+  plGizmoHandle* FindActiveGizmoHandle(const plObjectPickingResult& res);
+  bool PressActiveGizmoHandle(const plEditorInputEvent& e, const plObjectPickingResult& res, plEditorInput& out_result);
+  void HighlightHandle(const plUuid& handle);
+
+  // pivot editing
+  const plDocumentObject* FindPivotBrush() const;
+  void UpdatePivotGizmo();
+  void PivotGizmoEventHandler(const plGizmoEvent& e);
+
+  // snapping: Ctrl held during a move snaps to the nearest brush vertex near the cursor, else the grid
+  static bool IsSnapHeld();
+  static plVec3 SnapToGrid(const plVec3& vWorld);
+
+  /// With Snap To Grid on, the move becomes one that puts the low corner of the moving vertices on a grid
+  /// point: geometry on the grid stays on it, geometry off it lands on it. Restricted to vAxis if set.
+  plVec3 AlignMoveToGrid(const plVec3& vDelta, const plVec3& vAxis) const;
+  void GatherSnapVertices(bool bExcludeMovingVertices);
+  plVec3 SnapGizmoTranslation(const plVec3& vTranslate);
+
+  // mesh ops, selection ops, marquee, snapping
+  void BeginMeshModalOp(ModalOp::Enum op);
+  void UpdateMeshModalPreview(float fAmount);
+  plStatus ApplyImmediateMeshOp(plBrushMeshOp::Enum op);
+  void NotifySelectionChanged();
+  void UpdateMarquee(const plVec2I32& vCurrentPos);
+  void FinishMarquee(const plVec2I32& vCurrentPos, bool bAdditive, bool bSubtract);
+  bool IsElementFacingCamera(const plEditableMesh& mesh, plUInt32 uiElement) const;
+  bool ProjectToView(const plVec3& vWorld, plVec2& out_vScreen) const;
+  /// The snap vertex nearest to the cursor within fMaxPixels on screen.
+  bool FindSnapVertex(const plVec2I32& vViewPos, plVec3& out_vWorld, float fMaxPixels = 30.0f) const;
+  bool HandleActionShortcut(const plEditorInputEvent& e);
+
+  /// Keys while a modal operation runs: Esc, Enter, axis locks, snapping, segments and typed amounts. It takes every key.
+  plEditorInput HandleModalKey(const plEditorInputEvent& e);
+
   // overlays
+  /// The mesh the overlays show: the preview while a drag or modal operation runs, else the authored mesh.
+  const plEditableMesh& GetDisplayMesh() const { return (m_ModalOp != ModalOp::None || m_bInTemporaryCommands) ? m_PreviewMesh : m_BaseMesh; }
   void UpdateOverlays();
   void ClearOverlays();
-  void AppendFaceOutline(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace) const;
-  void AppendFaceInset(plDynamicArray<plVec3>& ref_lines, plUInt32 uiFace, float fInset) const;
+  /// The outline of the faces carrying the ids, without the edges between them.
+  static void AppendSelectionBorder(plDynamicArray<plVec3>& ref_lines, const plEditableMesh& mesh, const plHashSet<plUInt32>& faceIds);
+  static void AppendFaceWireframe(plDynamicArray<plVec3>& ref_lines, const plEditableMesh& mesh, plUInt32 uiFace);
 
   // element cube handles — the greybox-manipulator visual: solid constant-size cubes on every
   // selectable element (vertex / edge midpoint / face center), grey when idle, brand when selected,
@@ -207,8 +400,50 @@ private:
   plEditableMesh m_PreviewMesh;
   bool m_bInTemporaryCommands = false;
 
+  // modal mesh operations
+  plVec3 m_vOpAxis = plVec3::MakeZero(); ///< world axis the amount is measured along (extrude)
+  float m_fOpAmount = 0.0f;
+  plUInt32 m_uiOpSegments = 1;         ///< bevel segments / loop cut count
+  plUInt32 m_uiLoopEdgeV0 = plInvalidIndex;
+  plUInt32 m_uiLoopEdgeV1 = plInvalidIndex;
+
+  // click / marquee
+  bool m_bPressPending = false;
+  bool m_bMarqueeActive = false;
+  plVec2I32 m_vPressPos = plVec2I32(0, 0);
+  plUuid m_PressHandle;          ///< element cube under the cursor at press time
+  plVec3 m_vPressSurface;        ///< surface point under the cursor at press time
+  bool m_bPressHitBrush = false;
+  plEngineGizmoHandle m_hMarquee;
+  bool m_bSelectThrough = false;
+  bool m_bShowHiddenHandles = false;
+  plVec3 m_vHandleCameraPos = plVec3::MakeZero(); ///< camera the handle occlusion was last tested from
+  plVec3 m_vHandleCameraDir = plVec3::MakeZero();
+  bool m_bVertexSnap = false;    ///< V held during a move
+  plDynamicArray<plVec3> m_SnapVertices; ///< world positions a move can snap to, gathered at its start
+  const char* m_szSnapInfo = nullptr;    ///< what the last snapped move landed on, for the info line
+  bool m_bCarved = false;        ///< live cutters change the rendered mesh: show the authored cage
+  plEditableMesh m_CarvedMesh;   ///< the rendered (cut) mesh while m_bCarved, brush-local
+
+  plBrushFaceGranularity::Enum m_FaceGranularity = plBrushFaceGranularity::Surface;
+  mutable bool m_bSurfacesDirty = true;
+  mutable plEditableMesh m_SurfaceMesh;                     ///< rendered mesh, brush-local, attributes applied
+  mutable plDynamicArray<plUInt32> m_SurfaceOfFace;         ///< per m_SurfaceMesh face
+  mutable plDynamicArray<plUInt32> m_SurfaceRepresentative; ///< per surface: its largest face, where its handle sits
+
+  plStringBuilder m_sInfoText;
+
+  // clip tool
+  bool m_bClipActive = false;
+  plHybridArray<plVec3, 3> m_ClipPoints; ///< world space
+  plInt32 m_iClipKeep = 0;               ///< plBrushCommands::ClipKeep
+  plEngineGizmoHandle m_hClipLines;
+  void UpdateClipPreview();
+  void FinishClip(bool bApply);
+
   plEngineGizmoHandle m_hHoverLines;
   plEngineGizmoHandle m_hSelectionLines;
+  plEngineGizmoHandle m_hFaceWireLines;  ///< triangle wireframe of the selected faces, over their accent
   plEngineGizmoHandle m_hCandidateLines; ///< the brush wireframe — structural context, dim
 
   plDynamicArray<plUniquePtr<plEngineGizmoHandle>> m_ElementHandles; ///< cube pool; index = element index
@@ -222,4 +457,9 @@ private:
   plScaleGizmo m_ScaleGizmo;
   plTransform m_GizmoStartTransform = plTransform::MakeIdentity();
   plUuid m_LastHighlightedHandle;
+
+  // pivot editing: m_TranslateGizmo sits on the brush origin instead of the sub-object selection
+  bool m_bPivotEdit = false;
+  bool m_bPivotDragging = false;
+  plUuid m_PivotBrush; ///< brush component whose origin the gizmo shows
 };

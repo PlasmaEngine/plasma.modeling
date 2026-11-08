@@ -38,6 +38,8 @@ void plBrushFaceMaterialDragDropHandler::OnDragBegin(const plDragDropInfo* pInfo
   m_AppliedToComponent = plUuid();
   m_iAppliedToSlot = -1;
   m_uiAppliedFaceId = plInvalidIndex;
+  m_PickMeshComponent = plUuid();
+  m_PickMesh.Clear();
 
   m_pDocument->GetCommandHistory()->BeginTemporaryCommands("Drag Material", true);
 }
@@ -63,6 +65,8 @@ void plBrushFaceMaterialDragDropHandler::OnDragUpdate(const plDragDropInfo* pInf
   if (m_AppliedToComponent == pInfo->m_TargetComponent && m_iAppliedToSlot == pInfo->m_iTargetObjectSubID)
     return;
 
+  RevertPreview();
+
   m_AppliedToComponent = pInfo->m_TargetComponent;
   m_iAppliedToSlot = pInfo->m_iTargetObjectSubID;
   m_uiAppliedFaceId = plInvalidIndex;
@@ -76,9 +80,7 @@ void plBrushFaceMaterialDragDropHandler::OnDragUpdate(const plDragDropInfo* pInf
     cmd.m_sProperty = "Materials";
     cmd.m_NewValue = GetAssetGuidString(pInfo);
 
-    m_pDocument->GetCommandHistory()->StartTransaction("Assign Material");
-    m_pDocument->GetCommandHistory()->AddCommand(cmd).AssertSuccess();
-    m_pDocument->GetCommandHistory()->FinishTransaction();
+    RunInTransaction("Assign Material", cmd);
   }
   else if (pType->IsDerivedFrom<plGreyBoxComponent>())
   {
@@ -87,10 +89,53 @@ void plBrushFaceMaterialDragDropHandler::OnDragUpdate(const plDragDropInfo* pInf
     cmd.m_sProperty = "Material";
     cmd.m_NewValue = GetAssetGuidString(pInfo);
 
-    m_pDocument->GetCommandHistory()->StartTransaction("Assign Material");
-    m_pDocument->GetCommandHistory()->AddCommand(cmd).AssertSuccess();
-    m_pDocument->GetCommandHistory()->FinishTransaction();
+    RunInTransaction("Assign Material", cmd);
   }
+}
+
+void plBrushFaceMaterialDragDropHandler::RevertPreview()
+{
+  // the preview follows the cursor: what was assigned to the previous face or part is taken back
+  if (!m_AppliedToComponent.IsValid())
+    return;
+
+  auto* pHistory = m_pDocument->GetCommandHistory();
+  pHistory->CancelTemporaryCommands();
+  pHistory->BeginTemporaryCommands("Drag Material", true);
+
+  m_AppliedToComponent = plUuid();
+  m_iAppliedToSlot = -1;
+  m_uiAppliedFaceId = plInvalidIndex;
+}
+
+void plBrushFaceMaterialDragDropHandler::RunInTransaction(plStringView sName, plCommand& ref_cmd)
+{
+  plCommand* commands[] = {&ref_cmd};
+  RunInTransaction(sName, commands);
+}
+
+void plBrushFaceMaterialDragDropHandler::RunInTransaction(plStringView sName, plArrayPtr<plCommand* const> commands)
+{
+  auto* pHistory = m_pDocument->GetCommandHistory();
+  pHistory->StartTransaction(sName);
+
+  plStatus result(PL_SUCCESS);
+
+  for (plCommand* pCommand : commands)
+  {
+    if (result.Succeeded())
+      result = pHistory->AddCommand(*pCommand);
+  }
+
+  if (result.Failed())
+  {
+    // a failed preview must not leave the transaction open, or the document blocks every later edit
+    pHistory->CancelTransaction();
+    plLog::Error("Assigning the material failed: {}", result.m_sMessage);
+    return;
+  }
+
+  pHistory->FinishTransaction();
 }
 
 void plBrushFaceMaterialDragDropHandler::ApplyToBrushFace(const plDragDropInfo* pInfo, const plDocumentObject* pComponent)
@@ -99,22 +144,29 @@ void plBrushFaceMaterialDragDropHandler::ApplyToBrushFace(const plDragDropInfo* 
     return;
 
   // the EVALUATED mesh, so doorway jambs (cap faces from live cutters) are assignable too
-  plEditableMesh mesh;
-  if (plBrushPicking::BuildEvaluatedMeshFromObject(pComponent, mesh).Failed())
-    return;
+  if (m_PickMeshComponent != pComponent->GetGuid())
+  {
+    m_PickMeshComponent = plUuid();
 
-  // the drop position is world space; the mesh lives in the owner object's local space
-  const plGameObjectDocument* pGameDoc = plStaticCast<const plGameObjectDocument*>(m_pDocument);
-  const plTransform globalTransform = pGameDoc->GetGlobalTransform(pComponent->GetParent());
-  const plVec3 vLocalPos = globalTransform.GetInverse().TransformPosition(pInfo->m_vDropPosition);
+    if (plBrushPicking::BuildEvaluatedMeshFromObject(pComponent, m_PickMesh).Failed())
+      return;
 
-  const plUInt32 uiFaceId = plBrushPicking::PickFaceAtLocalPos(mesh, vLocalPos);
+    // the drop position is world space; the mesh lives in the owner object's local space
+    const plGameObjectDocument* pGameDoc = plStaticCast<const plGameObjectDocument*>(m_pDocument);
+    m_PickMeshInverseTransform = pGameDoc->GetGlobalTransform(pComponent->GetParent()).GetInverse();
+    m_PickMeshComponent = pComponent->GetGuid();
+  }
+
+  const plVec3 vLocalPos = m_PickMeshInverseTransform.TransformPosition(pInfo->m_vDropPosition);
+  const plUInt32 uiFaceId = plBrushPicking::PickFaceAtLocalPos(m_PickMesh, vLocalPos);
 
   if (uiFaceId == plInvalidIndex)
     return;
 
   if (m_AppliedToComponent == pInfo->m_TargetComponent && m_uiAppliedFaceId == uiFaceId)
     return;
+
+  RevertPreview();
 
   m_AppliedToComponent = pInfo->m_TargetComponent;
   m_iAppliedToSlot = -1;
@@ -136,33 +188,51 @@ void plBrushFaceMaterialDragDropHandler::ApplyToBrushFace(const plDragDropInfo* 
     }
   }
 
-  plHashTable<plUInt32, plUInt8> overrides;
-  plBrushComponent::ParseFaceData(acc.GetValue("FaceData").ConvertTo<plDataBuffer>(), overrides);
+  // every face without an override uses slot 0, which shows the default material while the Materials
+  // array is empty: that slot gets the default material written out, so the new one only reaches this face
+  plHybridArray<plInsertObjectPropertyCommand, 2> insertMaterials;
 
-  overrides[uiFaceId] = static_cast<plUInt8>(iSlot >= 0 ? iSlot : iMaterialCount);
-
-  plDataBuffer newFaceData;
-  plBrushComponent::WriteFaceData(overrides, newFaceData);
-
-  m_pDocument->GetCommandHistory()->StartTransaction("Assign Material To Face");
+  if (iSlot < 0 && iMaterialCount == 0)
+  {
+    plInsertObjectPropertyCommand& cmdDefault = insertMaterials.ExpandAndGetRef();
+    cmdDefault.m_Object = pInfo->m_TargetComponent;
+    cmdDefault.m_sProperty = "Materials";
+    cmdDefault.m_Index = 0;
+    cmdDefault.m_NewValue = plString(plBrushComponent::GetDefaultMaterialId());
+  }
 
   if (iSlot < 0)
   {
-    plInsertObjectPropertyCommand cmdMat;
+    iSlot = iMaterialCount + static_cast<plInt32>(insertMaterials.GetCount());
+
+    plInsertObjectPropertyCommand& cmdMat = insertMaterials.ExpandAndGetRef();
     cmdMat.m_Object = pInfo->m_TargetComponent;
     cmdMat.m_sProperty = "Materials";
-    cmdMat.m_Index = iMaterialCount;
+    cmdMat.m_Index = iSlot;
     cmdMat.m_NewValue = sMaterialGuid;
-    m_pDocument->GetCommandHistory()->AddCommand(cmdMat).AssertSuccess();
   }
+
+  plBrushFaceAttributeMap attributes;
+  plBrushPicking::ReadFaceAttributes(pComponent, attributes);
+
+  plBrushFaceAttributes& attr = attributes[uiFaceId];
+  attr.m_uiMask |= plBrushFaceAttributes::Slot;
+  attr.m_uiMaterialSlot = static_cast<plUInt8>(iSlot);
+
+  plDataBuffer newFaceData;
+  plBrushFaceAttributeCodec::Write(attributes, newFaceData);
 
   plSetObjectPropertyCommand cmdFace;
   cmdFace.m_Object = pInfo->m_TargetComponent;
   cmdFace.m_sProperty = "FaceData";
   cmdFace.m_NewValue = newFaceData;
-  m_pDocument->GetCommandHistory()->AddCommand(cmdFace).AssertSuccess();
 
-  m_pDocument->GetCommandHistory()->FinishTransaction();
+  plHybridArray<plCommand*, 3> commands;
+  for (plInsertObjectPropertyCommand& cmd : insertMaterials)
+    commands.PushBack(&cmd);
+  commands.PushBack(&cmdFace);
+
+  RunInTransaction("Assign Material To Face", commands.GetArrayPtr());
 }
 
 void plBrushFaceMaterialDragDropHandler::OnDragCancel()

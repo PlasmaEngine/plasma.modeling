@@ -7,6 +7,7 @@
 #include <Core/WorldSerializer/WorldWriter.h>
 #include <Foundation/IO/MemoryStream.h>
 #include <ModelingPlugin/Modeling/BrushComponent.h>
+#include <ModelingPlugin/Modeling/BrushEvaluator.h>
 #include <ModelingPlugin/Modeling/BrushWorldModule.h>
 #include <ModelingPlugin/Modeling/MeshCSG.h>
 #include <RendererCore/Material/MaterialResource.h>
@@ -19,8 +20,12 @@
 // Data/Base/Materials/Common/Pattern.plMaterialAsset — the default blockout material, same as greybox.
 static const char* s_szDefaultBrushMaterial = "{ 1c47ee4c-0379-4280-85f5-b8cda61941d2 }";
 
+// Data/Base/Materials/Common/PhysicsCollidersTransparent.plMaterialAsset — see-through, two-sided,
+// fullbright: the cutter look in edit mode, tinted through the instance colour.
+static const char* s_szCutterMaterial = "{ 785a756f-c69c-4f44-b31f-1743806fd4f5 }"; // Base/Materials/BaseMaterials/Transparent: tint and opacity from the instance colour
+
 // clang-format off
-PL_BEGIN_COMPONENT_TYPE(plBrushComponent, 2, plComponentMode::Static)
+PL_BEGIN_COMPONENT_TYPE(plBrushComponent, 3, plComponentMode::Static)
 {
   PL_BEGIN_PROPERTIES
   {
@@ -35,12 +40,16 @@ PL_BEGIN_COMPONENT_TYPE(plBrushComponent, 2, plComponentMode::Static)
     PL_ACCESSOR_PROPERTY("SizePosY", GetSizePosY, SetSizePosY)->AddAttributes(new plDefaultValueAttribute(1.0f)),
     PL_ACCESSOR_PROPERTY("SizeNegZ", GetSizeNegZ, SetSizeNegZ)->AddAttributes(new plDefaultValueAttribute(1.0f)),
     PL_ACCESSOR_PROPERTY("SizePosZ", GetSizePosZ, SetSizePosZ)->AddAttributes(new plDefaultValueAttribute(1.0f)),
-    PL_ACCESSOR_PROPERTY("Detail", GetDetail, SetDetail)->AddAttributes(new plGroupAttribute("Misc"), new plDefaultValueAttribute(16), new plClampValueAttribute(1, 64)),
+    PL_ACCESSOR_PROPERTY("Detail", GetDetail, SetDetail)->AddAttributes(new plGroupAttribute("Shape"), new plDefaultValueAttribute(16), new plClampValueAttribute(1, 64)),
     PL_ACCESSOR_PROPERTY("Curvature", GetCurvature, SetCurvature)->AddAttributes(new plClampValueAttribute(plAngle::MakeFromDegree(-360), plAngle::MakeFromDegree(360))),
     PL_ACCESSOR_PROPERTY("Thickness", GetThickness, SetThickness)->AddAttributes(new plDefaultValueAttribute(0.5f), new plClampValueAttribute(0.0f, plVariant())),
-    PL_ACCESSOR_PROPERTY("GenerateCollision", GetGenerateCollision, SetGenerateCollision)->AddAttributes(new plDefaultValueAttribute(true)),
+    PL_ACCESSOR_PROPERTY("SmoothingAngle", GetSmoothingAngle, SetSmoothingAngle)->AddAttributes(new plGroupAttribute("Surface"), new plDefaultValueAttribute(plAngle::MakeFromDegree(40.0f)), new plClampValueAttribute(plAngle::MakeFromDegree(0.0f), plAngle::MakeFromDegree(180.0f))),
+    PL_ACCESSOR_PROPERTY("TextureLock", GetTextureLock, SetTextureLock)->AddAttributes(new plDefaultValueAttribute(true)),
+    PL_ACCESSOR_PROPERTY("GenerateCollision", GetGenerateCollision, SetGenerateCollision)->AddAttributes(new plGroupAttribute("Output"), new plDefaultValueAttribute(true)),
     PL_ACCESSOR_PROPERTY("IncludeInNavmesh", GetIncludeInNavmesh, SetIncludeInNavmesh)->AddAttributes(new plDefaultValueAttribute(true)),
-    PL_MEMBER_PROPERTY("UseAsOccluder", m_bUseAsOccluder)->AddAttributes(new plDefaultValueAttribute(true)),
+    PL_ACCESSOR_PROPERTY("UseAsOccluder", GetUseAsOccluder, SetUseAsOccluder)->AddAttributes(new plDefaultValueAttribute(true)),
+    PL_ACCESSOR_PROPERTY("MergeOnExport", GetMergeOnExport, SetMergeOnExport)->AddAttributes(new plDefaultValueAttribute(true)),
+    PL_ACCESSOR_PROPERTY("BrushId", GetBrushId, SetBrushId)->AddAttributes(new plHiddenAttribute()),
     PL_ACCESSOR_PROPERTY("FaceData", GetFaceData, SetFaceData)->AddAttributes(new plHiddenAttribute()),
     PL_ACCESSOR_PROPERTY("StoredMesh", GetStoredMesh, SetStoredMesh)->AddAttributes(new plHiddenAttribute()),
   }
@@ -68,6 +77,11 @@ PL_END_COMPONENT_TYPE;
 
 plBrushComponent::plBrushComponent() = default;
 plBrushComponent::~plBrushComponent() = default;
+
+const char* plBrushComponent::GetDefaultMaterialId()
+{
+  return s_szDefaultBrushMaterial;
+}
 
 void plBrushComponent::SerializeComponent(plWorldWriter& inout_stream) const
 {
@@ -101,6 +115,12 @@ void plBrushComponent::SerializeComponent(plWorldWriter& inout_stream) const
 
   s.WriteArray(m_FaceData).AssertSuccess();
   s.WriteArray(m_StoredMesh).AssertSuccess();
+
+  // version 3
+  s << m_uiBrushId;
+  s << m_SmoothingAngle;
+  s << m_bTextureLock;
+  s << m_bMergeOnExport;
 }
 
 void plBrushComponent::DeserializeComponent(plWorldReader& inout_stream)
@@ -140,6 +160,17 @@ void plBrushComponent::DeserializeComponent(plWorldReader& inout_stream)
 
   s.ReadArray(m_FaceData).AssertSuccess();
   s.ReadArray(m_StoredMesh).AssertSuccess();
+
+  if (uiVersion >= 3)
+  {
+    s >> m_uiBrushId;
+    s >> m_SmoothingAngle;
+    s >> m_bTextureLock;
+    s >> m_bMergeOnExport;
+  }
+
+  plBrushFaceAttributeCodec::Parse(m_FaceData, m_FaceAttributes);
+  ++m_uiAuthoredRevision;
 }
 
 void plBrushComponent::OnActivated()
@@ -196,16 +227,25 @@ void plBrushComponent::OnMsgExtractRenderData(plMsgExtractRenderData& msg) const
     return;
 
   const bool bDynamic = GetOwner()->IsDynamic();
-  auto hInstanceDataBuffer = msg.m_pRenderDataManager->GetOrCreateInstanceDataAndFill(*this, bDynamic, GetOwner()->GetGlobalTransform(), m_InstanceDataOffset, GetUniqueIdForRendering(), m_Color, m_vCustomData);
+
+  // cutters: see-through amber, red when they cannot cut (not convex)
+  const plColor instanceColor = m_bSubtractive ? (m_bCutterConvex ? plColor(1.0f, 0.62f, 0.15f, 0.35f) : plColor(1.0f, 0.15f, 0.1f, 0.5f)) : m_Color;
+  auto hInstanceDataBuffer = msg.m_pRenderDataManager->GetOrCreateInstanceDataAndFill(*this, bDynamic, GetOwner()->GetGlobalTransform(), m_InstanceDataOffset, GetUniqueIdForRendering(), instanceColor, m_vCustomData);
 
   plResourceLock<plMeshResource> pMesh(m_hMesh, plResourceAcquireMode::AllowLoadingFallback);
   plArrayPtr<const plMeshResourceDescriptor::SubMesh> parts = pMesh->GetSubMeshes();
+
+  static plMaterialResourceHandle s_hCutterMaterial;
+  if (m_bSubtractive && !s_hCutterMaterial.IsValid())
+  {
+    s_hCutterMaterial = plResourceManager::LoadResource<plMaterialResource>(s_szCutterMaterial);
+  }
 
   for (plUInt32 uiPartIndex = 0; uiPartIndex < parts.GetCount(); ++uiPartIndex)
   {
     const plUInt32 uiMaterialIndex = parts[uiPartIndex].m_uiMaterialIndex;
 
-    plMaterialResourceHandle hMaterial = GetMaterial(uiMaterialIndex);
+    plMaterialResourceHandle hMaterial = m_bSubtractive ? s_hCutterMaterial : GetMaterial(uiMaterialIndex);
     if (!hMaterial.IsValid())
     {
       hMaterial = pMesh->GetMaterials()[uiMaterialIndex];
@@ -225,7 +265,7 @@ void plBrushComponent::OnMsgExtractRenderData(plMsgExtractRenderData& msg) const
 void plBrushComponent::SetShape(plEnum<plBrushShape> shape)
 {
   m_Shape = shape;
-  InvalidateMesh();
+  OnAuthoredChange();
 }
 
 void plBrushComponent::SetSubtractive(bool b)
@@ -236,6 +276,42 @@ void plBrushComponent::SetSubtractive(bool b)
   m_bSubtractive = b;
 
   // the world module's change detection re-carves affected additive brushes next frame
+  OnAuthoredChange();
+}
+
+void plBrushComponent::SetUseAsOccluder(bool b)
+{
+  m_bUseAsOccluder = b;
+  m_pOccluderObject = nullptr;
+  TriggerLocalBoundsUpdate();
+}
+
+void plBrushComponent::SetSmoothingAngle(plAngle angle)
+{
+  m_SmoothingAngle = angle;
+  InvalidateMesh();
+}
+
+void plBrushComponent::SetTextureLock(bool b)
+{
+  m_bTextureLock = b;
+  InvalidateMesh();
+}
+
+void plBrushComponent::SetBrushId(plUInt32 uiId)
+{
+  if (m_uiBrushId == uiId)
+    return;
+
+  m_uiBrushId = uiId;
+
+  // a cutter's id keys the faces it cuts and its evaluation order
+  OnAuthoredChange();
+}
+
+void plBrushComponent::OnAuthoredChange()
+{
+  ++m_uiAuthoredRevision;
   InvalidateMesh();
 }
 
@@ -261,29 +337,29 @@ const plVec4& plBrushComponent::GetCustomData() const
   return m_vCustomData;
 }
 
-void plBrushComponent::SetSizeNegX(float f) { m_Params.m_fSizeNegX = f; InvalidateMesh(); }
-void plBrushComponent::SetSizePosX(float f) { m_Params.m_fSizePosX = f; InvalidateMesh(); }
-void plBrushComponent::SetSizeNegY(float f) { m_Params.m_fSizeNegY = f; InvalidateMesh(); }
-void plBrushComponent::SetSizePosY(float f) { m_Params.m_fSizePosY = f; InvalidateMesh(); }
-void plBrushComponent::SetSizeNegZ(float f) { m_Params.m_fSizeNegZ = f; InvalidateMesh(); }
-void plBrushComponent::SetSizePosZ(float f) { m_Params.m_fSizePosZ = f; InvalidateMesh(); }
+void plBrushComponent::SetSizeNegX(float f) { m_Params.m_fSizeNegX = f; OnAuthoredChange(); }
+void plBrushComponent::SetSizePosX(float f) { m_Params.m_fSizePosX = f; OnAuthoredChange(); }
+void plBrushComponent::SetSizeNegY(float f) { m_Params.m_fSizeNegY = f; OnAuthoredChange(); }
+void plBrushComponent::SetSizePosY(float f) { m_Params.m_fSizePosY = f; OnAuthoredChange(); }
+void plBrushComponent::SetSizeNegZ(float f) { m_Params.m_fSizeNegZ = f; OnAuthoredChange(); }
+void plBrushComponent::SetSizePosZ(float f) { m_Params.m_fSizePosZ = f; OnAuthoredChange(); }
 
 void plBrushComponent::SetDetail(plUInt32 uiDetail)
 {
   m_Params.m_uiDetail = uiDetail;
-  InvalidateMesh();
+  OnAuthoredChange();
 }
 
 void plBrushComponent::SetCurvature(plAngle curvature)
 {
   m_Params.m_Curvature = curvature;
-  InvalidateMesh();
+  OnAuthoredChange();
 }
 
 void plBrushComponent::SetThickness(float f)
 {
   m_Params.m_fThickness = f;
-  InvalidateMesh();
+  OnAuthoredChange();
 }
 
 void plBrushComponent::SetGenerateCollision(bool b)
@@ -299,18 +375,22 @@ void plBrushComponent::SetIncludeInNavmesh(bool b)
 void plBrushComponent::SetFaceData(const plDataBuffer& data)
 {
   m_FaceData = data;
+  plBrushFaceAttributeCodec::Parse(m_FaceData, m_FaceAttributes);
+
+  // attributes do not change what a cutter carves, so the world module need not hear about them
   InvalidateMesh();
 }
 
 void plBrushComponent::SetStoredMesh(const plDataBuffer& data)
 {
   m_StoredMesh = data;
-  InvalidateMesh();
+  OnAuthoredChange();
 }
 
 void plBrushComponent::SetMaterial(plUInt32 uiIndex, const plMaterialResourceHandle& hMaterial)
 {
-  if (uiIndex >= 64)
+  // face slots are 8 bit
+  if (uiIndex > 255)
   {
     plLog::Error("Invalid material slot index on brush component.");
     return;
@@ -377,91 +457,24 @@ void plBrushComponent::Materials_Remove(plUInt32 uiIndex)
   InvalidateMesh();
 }
 
-constexpr plUInt8 c_uiFaceDataVersion = 1;
-
-void plBrushComponent::ParseFaceData(const plDataBuffer& data, plHashTable<plUInt32, plUInt8>& out_overrides)
-{
-  out_overrides.Clear();
-
-  if (data.IsEmpty())
-    return;
-
-  plRawMemoryStreamReader reader(data.GetData(), data.GetCount());
-
-  plUInt8 uiVersion = 0;
-  reader >> uiVersion;
-
-  if (uiVersion != c_uiFaceDataVersion)
-    return;
-
-  plUInt32 uiCount = 0;
-  reader >> uiCount;
-
-  out_overrides.Reserve(uiCount);
-
-  for (plUInt32 i = 0; i < uiCount; ++i)
-  {
-    plUInt32 uiFaceId = 0;
-    plUInt8 uiSlot = 0;
-    reader >> uiFaceId;
-    reader >> uiSlot;
-    out_overrides[uiFaceId] = uiSlot;
-  }
-}
-
-void plBrushComponent::WriteFaceData(const plHashTable<plUInt32, plUInt8>& overrides, plDataBuffer& out_data)
-{
-  out_data.Clear();
-
-  if (overrides.IsEmpty())
-    return;
-
-  plDefaultMemoryStreamStorage storage;
-  plMemoryStreamWriter writer(&storage);
-
-  writer << c_uiFaceDataVersion;
-  writer << overrides.GetCount();
-
-  for (auto it : overrides)
-  {
-    writer << it.Key();
-    writer << it.Value();
-  }
-
-  out_data.SetCountUninitialized(storage.GetStorageSize32());
-
-  plRawMemoryStreamWriter rawWriter(out_data.GetData(), out_data.GetCount());
-  storage.CopyToStream(rawWriter).IgnoreResult();
-}
-
 void plBrushComponent::BuildEditableMesh(plEditableMesh& out_mesh) const
 {
   if (m_Shape == plBrushShape::Editable)
   {
-    if (out_mesh.FromDataBuffer(m_StoredMesh).Failed())
+    const bool bLoaded = out_mesh.FromDataBuffer(m_StoredMesh).Succeeded();
+    const bool bDamaged = !bLoaded && !m_StoredMesh.IsEmpty();
+
+    if (bDamaged && !m_bDamagedMesh)
     {
-      out_mesh.Clear();
+      plLog::Error("Brush '{}': the stored mesh is damaged and was not loaded. The brush renders nothing until it is re-authored.", GetOwner() ? GetOwner()->GetName() : "");
     }
+
+    m_bDamagedMesh = bDamaged;
   }
   else
   {
+    m_bDamagedMesh = false;
     plBrushGenerators::Generate(m_Shape, m_Params, out_mesh);
-  }
-
-  // apply the per-face material overrides, keyed by semantic face id
-  plHashTable<plUInt32, plUInt8> overrides;
-  ParseFaceData(m_FaceData, overrides);
-
-  if (!overrides.IsEmpty())
-  {
-    for (plBrushFace& face : out_mesh.m_Faces)
-    {
-      plUInt8 uiSlot = 0;
-      if (overrides.TryGetValue(face.m_uiFaceId, uiSlot))
-      {
-        face.m_uiMaterialSlot = uiSlot;
-      }
-    }
   }
 }
 
@@ -469,78 +482,48 @@ void plBrushComponent::BuildEvaluatedMesh(plEditableMesh& out_mesh) const
 {
   BuildEditableMesh(out_mesh);
 
+  plHybridArray<plBrushCutterInput, 4> cutters;
+  plHybridArray<plBrushRoomInput, 4> rooms;
+  plBrushRoomContext roomContext;
+  roomContext.m_uiTargetBrushId = m_uiBrushId;
+
   // a cutter never gets carved itself
-  if (m_bSubtractive || out_mesh.m_Faces.IsEmpty())
-    return;
-
-  const plBrushWorldModule* pModule = GetWorld()->GetModule<plBrushWorldModule>();
-
-  if (pModule == nullptr)
-    return;
-
-  const plBoundingBox localBounds = out_mesh.ComputeBounds();
-
-  if (!localBounds.IsValid())
-    return;
-
-  const plTransform ownTransform = GetOwner()->GetGlobalTransform();
-
-  plBoundingBox worldBounds = localBounds;
-  worldBounds.TransformFromOrigin(ownTransform.GetAsMat4());
-
-  plDynamicArray<const plBrushComponent*> cutters;
-  pModule->QueryCutters(worldBounds, cutters);
-
-  plEditableMesh cutterMesh, result;
-
-  for (const plBrushComponent* pCutter : cutters)
+  if (!m_bSubtractive && !out_mesh.m_Faces.IsEmpty())
   {
-    if (pCutter == this)
-      continue;
-
-    pCutter->BuildEditableMesh(cutterMesh);
-
-    if (cutterMesh.m_Faces.IsEmpty())
-      continue;
-
-    const plTransform cutterToSelf = plTransform::MakeLocalTransform(ownTransform, pCutter->GetOwner()->GetGlobalTransform());
-
-    // a non-convex cutter shell refuses cleanly — the target stays uncut by that cutter
-    if (plMeshCSG::SubtractCutter(out_mesh, cutterMesh, cutterToSelf, 0, result).Succeeded())
+    if (const plBrushWorldModule* pModule = GetWorld()->GetModule<plBrushWorldModule>())
     {
-      out_mesh = result;
-    }
+      // the base mesh bounds decide which cutters matter; a room's passages stay inside its cutters
+      plBoundingBox worldBounds = out_mesh.ComputeBounds();
+      worldBounds.TransformFromOrigin(GetOwner()->GetGlobalTransform().GetAsMat4());
 
-    if (out_mesh.m_Faces.IsEmpty())
-      return;
+      const bool bHasRooms = plMeshCSG::HasInvertedShell(out_mesh);
+      pModule->GatherCutters(this, worldBounds, cutters, bHasRooms);
+
+      if (bHasRooms)
+      {
+        pModule->GatherRooms(this, cutters, rooms);
+        roomContext.m_OtherRooms = rooms.GetArrayPtr();
+      }
+    }
   }
+
+  plBrushEvaluator::Evaluate(out_mesh, GetOwner()->GetGlobalTransform(), cutters, m_FaceAttributes, nullptr, &roomContext);
 }
 
-plUInt64 plBrushComponent::ComputeContentHash() const
+const plTransform* plBrushComponent::GetUVSpace(plTransform& ref_storage) const
 {
-  // geometry inputs only — materials and colors do not change what a cutter carves
-  plUInt64 uiHash = plHashingUtils::xxHash64(&m_Shape, sizeof(m_Shape));
-  uiHash = plHashingUtils::xxHash64(&m_Params, sizeof(m_Params), uiHash);
-  uiHash = plHashingUtils::xxHash64(&m_bSubtractive, sizeof(m_bSubtractive), uiHash);
+  if (m_bTextureLock)
+    return nullptr;
 
-  if (!m_FaceData.IsEmpty())
-  {
-    uiHash = plHashingUtils::xxHash64(m_FaceData.GetData(), m_FaceData.GetCount(), uiHash);
-  }
-
-  if (!m_StoredMesh.IsEmpty())
-  {
-    uiHash = plHashingUtils::xxHash64(m_StoredMesh.GetData(), m_StoredMesh.GetCount(), uiHash);
-  }
-
-  return uiHash;
+  ref_storage = GetOwner()->GetGlobalTransform();
+  return &ref_storage;
 }
 
 void plBrushComponent::GenerateMeshName(const plEditableMesh& mesh, plStringBuilder& out_sName) const
 {
   // The mesh identity is a content hash of the EVALUATED mesh: identical brushes (duplicates) share
-  // one GPU mesh, and any change to shape, parameters, overlapping cutters, face overrides or the
-  // material list produces a new resource.
+  // one GPU mesh, and any change to shape, parameters, overlapping cutters, face overrides, shading or
+  // the material list produces a new resource.
   plDefaultMemoryStreamStorage storage;
   plMemoryStreamWriter writer(&storage);
   mesh.Serialize(writer);
@@ -548,6 +531,17 @@ void plBrushComponent::GenerateMeshName(const plEditableMesh& mesh, plStringBuil
   for (const auto& mat : m_Materials)
   {
     writer << mat.GetResourceID();
+  }
+
+  writer << m_SmoothingAngle;
+
+  // world-space UVs depend on where the brush stands
+  plTransform uvSpace;
+  if (GetUVSpace(uvSpace) != nullptr)
+  {
+    writer << uvSpace.m_vPosition;
+    writer << uvSpace.m_qRotation;
+    writer << uvSpace.m_vScale;
   }
 
   plHybridArray<plUInt8, 1024 * 4> bytes;
@@ -587,7 +581,8 @@ void plBrushComponent::GenerateMeshResourceDescriptor(plMeshResourceDescriptor& 
 {
   plGeometry geom;
   plDynamicArray<plBrushSubMeshRange> ranges;
-  mesh.BuildRenderGeometry(geom, ranges, m_Color);
+  plTransform uvSpace;
+  mesh.BuildRenderGeometry(geom, ranges, m_SmoothingAngle, GetUVSpace(uvSpace));
 
   geom.ComputeTangents();
 
@@ -616,6 +611,20 @@ plTypedResourceHandle<ResourceType> plBrushComponent::GenerateMesh() const
   plEditableMesh mesh;
   BuildEvaluatedMesh(mesh);
 
+  if (m_bSubtractive)
+  {
+    // any closed shape cuts: non-convex cutters are split into convex pieces when they are evaluated
+    plEditableMesh pieces;
+    const bool bConvex = mesh.m_Faces.IsEmpty() || plMeshCSG::MakeConvexCutter(mesh, pieces).Succeeded();
+
+    if (!bConvex && m_bCutterConvex)
+    {
+      plLog::Warning("Brush cutter '{}' cannot be split into convex pieces (is it closed?), so it cuts nothing.", GetOwner()->GetName());
+    }
+
+    m_bCutterConvex = bConvex;
+  }
+
   plStringBuilder sResourceName;
   GenerateMeshName(mesh, sResourceName);
 
@@ -640,7 +649,7 @@ void plBrushComponent::OnBuildStaticMesh(plMsgBuildStaticMesh& msg) const
 
   plGeometry geom;
   plDynamicArray<plBrushSubMeshRange> ranges;
-  mesh.BuildRenderGeometry(geom, ranges, m_Color);
+  mesh.BuildRenderGeometry(geom, ranges);
 
   auto* pDesc = msg.m_pStaticMeshDescription;
   const plTransform t = GetOwner()->GetGlobalTransform();
@@ -730,7 +739,7 @@ void plBrushComponent::OnMsgExtractOccluderData(plMsgExtractOccluderData& msg) c
     {
       plGeometry geom;
       plDynamicArray<plBrushSubMeshRange> ranges;
-      mesh.BuildRenderGeometry(geom, ranges, m_Color);
+      mesh.BuildRenderGeometry(geom, ranges);
 
       m_pOccluderObject = plRasterizerObject::CreateMesh(sResourceName, geom);
     }
@@ -758,16 +767,41 @@ void plBrushComponent::OnMsgSetCustomData(plMsgSetCustomData& ref_msg)
 
 void plBrushComponent::InvalidateMesh()
 {
-  m_pOccluderObject = nullptr;
-
+  // property changes arrive in bursts (a drag in the editor undoes and redoes several properties per mouse
+  // move), so the mesh is regenerated once, by the world module's next update
   if (m_hMesh.IsValid())
   {
-    m_hMesh.Invalidate();
-
-    m_hMesh = GenerateMesh<plMeshResource>();
-
-    TriggerLocalBoundsUpdate();
+    m_bMeshDirty = true;
   }
+}
+
+void plBrushComponent::InvalidateBrushMesh()
+{
+  if (m_hMesh.IsValid())
+  {
+    RegenerateMesh();
+  }
+}
+
+void plBrushComponent::RebuildMeshIfDirty()
+{
+  if (m_bMeshDirty)
+  {
+    RegenerateMesh();
+  }
+}
+
+void plBrushComponent::RegenerateMesh()
+{
+  m_bMeshDirty = false;
+  m_pOccluderObject = nullptr;
+
+  m_hMesh.Invalidate();
+  m_hMesh = GenerateMesh<plMeshResource>();
+
+  // static brushes cache their render data, which still points at the old mesh
+  InvalidateCachedRenderData();
+  TriggerLocalBoundsUpdate();
 }
 
 
